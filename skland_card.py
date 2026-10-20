@@ -336,6 +336,9 @@ class CardRenderer:
         """
         if not self.available:
             return None
+        if not rows:
+            # 空列表直接返回 None，由调用方回退纯文本，不画空白卡片
+            return None
 
         try:
             from PIL import Image, ImageDraw
@@ -344,12 +347,15 @@ class CardRenderer:
 
         try:
             c = self.theme
-            W, PAD, ROW = 720, 44, 54
-            AWARD_H = 26  # 奖励行高度
+            W, PAD = 720, 44
+            # 纵向节奏：名字 23px，奖励 15px 作为副标题。
+            # NAME_H 含「名字高度 + 与奖励的间距」，奖励紧随其后。
+            NAME_H = 34   # 名字行高（23px 字号 + 11px 间距）
+            AWARD_H = 24  # 奖励行高（15px 字号 + 底部留白）
+            ROW = 54      # 无奖励用户的整行高度
 
-            # 一个人占一行（ROW），有奖励的额外占一行（AWARD_H）
-            base_rows = 0
-            award_rows = 0
+            # 先算总高度再决定画布，避免底部留白
+            total_h = 0
             for r in rows:
                 ak_names = r.get("ak_names")
                 ef_names = r.get("ef_names")
@@ -359,10 +365,11 @@ class CardRenderer:
                 has_name = any(ak_names) or any(ef_names) or r.get("name")
                 if not has_name:
                     continue
-                base_rows += 1
                 if r.get("ak_awards") or r.get("ef_awards") or r.get("awards"):
-                    award_rows += 1
-            H = 150 + base_rows * ROW + award_rows * AWARD_H + 62
+                    total_h += NAME_H + AWARD_H
+                else:
+                    total_h += ROW
+            H = 150 + max(total_h, 1) + 62
 
             img = Image.new("RGB", (W, H), c["bg"])
             d = ImageDraw.Draw(img)
@@ -453,7 +460,7 @@ class CardRenderer:
                 label, label_size = self._fit_text(d, label, max_px, 23, bold=True)
                 self._text(d, (x, y), label, label_size, c["text"], bold=True)
 
-                y += ROW
+                y += NAME_H
 
                 # 奖励另起一行：两个游戏的奖励用「｜」分隔，不做列对齐
                 ak_awards = [str(a) for a in (r.get("ak_awards") or []) if a]
@@ -473,8 +480,13 @@ class CardRenderer:
                     award_px = W - PAD - award_x
                     award_text, award_size = self._fit_text(
                         d, award_text, award_px, 15, min_size=11)
-                    self._text(d, (award_x, y - 2), award_text, award_size, c["muted"])
+                    # 奖励画在名字下方（NAME_H 已含 11px 间距）
+                    self._text(d, (award_x, y), award_text, award_size,
+                               c["muted"])
                     y += AWARD_H
+                else:
+                    # 无奖励的用户补齐行高，保持整体节奏一致
+                    y += ROW - NAME_H
 
             d.rectangle([PAD, H - 64, W - PAD, H - 63], fill=c["div"])
             # 统计按实际绑定的游戏计数，未绑定某游戏的不计入

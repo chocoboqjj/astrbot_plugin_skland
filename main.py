@@ -115,6 +115,10 @@ class SklandPlugin(Star):
              "开启后 /skd 以图片卡片输出签到状态；缺少 Pillow 或中文字体时自动回退为文本"),
             ("卡片主题", "card_theme", "dark",
              "dark=深色 / light=浅色，仅在启用图片卡片时生效"),
+            ("token 冲突处理", "token_conflict", "reject",
+             "已绑定的 token 被再次绑定时如何处理："
+             "reject=一律拒绝（推荐，仅支持 QQ 官方平台）；"
+             "merge=自动复用原记录，用于清理历史重复数据"),
         ]
         for name, key, value, description in defaults:
             put_config(
@@ -139,6 +143,7 @@ class SklandPlugin(Star):
             "live_query_in_group": self.config.get("live_query_in_group", False),
             "card_image_enabled": self.config.get("card_image_enabled", False),
             "card_theme": self.config.get("card_theme", "dark"),
+            "token_conflict": self.config.get("token_conflict", "reject"),
         }
 
     # ==================== Platform Capability ====================
@@ -206,7 +211,14 @@ class SklandPlugin(Star):
 
     @staticmethod
     def _resolve_user_key(users: dict, user_id: str) -> str:
-        """解析规范用户键；同一用户跨平台(openid/QQ号)通过 alias 归一"""
+        """
+        解析规范用户键。
+
+        当前只支持 QQ 官方平台，sender_id 即稳定的 openid，
+        通常原样返回。保留 alias 读取是为了兼容历史数据 ——
+        早期版本支持跨平台（OneBot 的 QQ 号 / QQ 官方的 openid）时
+        会写入别名记录指回主记录，这里继续解析避免存量数据失效。
+        """
         seen = set()
         current = user_id
         while current in users and current not in seen:
@@ -863,27 +875,11 @@ class SklandPlugin(Star):
         accounts = self._get_accounts(user_data)
         fallback = self._display_name(user_data.get("nickname", ""), user_data)
 
-        ak_names, ak_states = [], []
-        ef_names, ef_states = [], []
-        ak_awards, ef_awards = [], []
-        for account in accounts:
-            last_sign = account.get("last_sign") or {}
-            names = account.get("game_names") or {}
-            awards_map = account.get("game_awards") or {}
-            nick = self._display_name(account.get("nickname", ""), user_data)
-
-            ak_signed = bool(last_sign.get("arknights"))
-            ef_signed = bool(last_sign.get("endfield"))
-            ak_name = names.get("arknights") or (nick if ak_signed else "")
-            ef_name = names.get("endfield") or (nick if ef_signed else "")
-            if ak_name:
-                ak_names.append(ak_name)
-                ak_states.append(ak_signed)
-                ak_awards.extend(awards_map.get("arknights") or [])
-            if ef_name:
-                ef_names.append(ef_name)
-                ef_states.append(ef_signed)
-                ef_awards.extend(awards_map.get("endfield") or [])
+        # 同名角色合并（不同账号/服务器可能重名），避免出现重复名字
+        ak_names, ak_states, ak_awards = self._collect_game_entries(
+            accounts, "arknights", "arknights", user_data)
+        ef_names, ef_states, ef_awards = self._collect_game_entries(
+            accounts, "endfield", "endfield", user_data)
 
         return [{
             "name": fallback,
@@ -1243,25 +1239,46 @@ class SklandPlugin(Star):
         max_users = config.get("max_users", 10)
         if (user_id not in users and max_users > 0
                 and self._count_real_users(users) >= max_users):
+            # 消息里已含 token，拒绝绑定也要撤回，防止 token 留在群里
             yield event.plain_result(
                 f"❌ 绑定失败：已达到最大用户数限制（{max_users}个）\n请联系管理员调整配置"
+                + await self._recall_and_note(event, is_group)
             )
             return
 
         # 全局唯一：一个 token 只应存在于一条用户记录中。
-        # 若该 token 已绑定在别的记录下（跨平台登录同一账号），
-        # 直接复用那条记录，而不是新建 —— 从根上避免重复。
+        # 只支持 QQ 官方平台，sender_id 即稳定的 openid，
+        # 因此「token 已绑在别的用户下」即可断定是他人冒用/共享，直接拒绝。
+        # 仅当管理员显式配置 merge 时才自动复用（用于清理历史重复数据）。
         duplicate_of = self._find_user_by_token(users, token, exclude="")
+        conflict_action = config.get("token_conflict", "reject")
         merged_note = ""
         if duplicate_of and duplicate_of != user_id:
+            if conflict_action != "merge":
+                owner = users.get(duplicate_of) or {}
+                owner_nick = (owner.get("nickname")
+                              or owner.get("last_username") or "其他用户")
+                logger.warning(
+                    f"用户 {user_id} 尝试绑定已属于 {duplicate_of}"
+                    f"（{owner_nick}）的 token，已拒绝"
+                )
+                yield event.plain_result(
+                    "❌ 绑定失败：该森空岛账号已被其他用户绑定\n\n"
+                    f"• 当前绑定者：{owner_nick}\n"
+                    "• 如果这是你自己的账号，请用当前 QQ 重新登录，\n"
+                    "  或联系管理员使用 /skdmerge 合并记录\n"
+                    "• 如果是账号共享，请让各自使用自己的 token"
+                    # 拒绝时也要撤回，token 已经暴露在群里了
+                    + await self._recall_and_note(event, is_group)
+                )
+                return
+
             logger.info(
                 f"用户 {user_id} 提交的 token 已绑定在 {duplicate_of}，"
-                f"复用该记录以避免重复"
+                f"按配置复用该记录"
             )
             user_id = duplicate_of
-            merged_note = (
-                "\n\n🔗 该账号此前已在其他平台绑定，已复用原记录（不会重复）"
-            )
+            merged_note = "\n\n🔗 该账号已绑定过，已复用原记录（不会重复）"
         elif duplicate_of == user_id:
             merged_note = "\n\n🔗 该账号此前已绑定，本次为更新签到状态"
 
@@ -1270,7 +1287,7 @@ class SklandPlugin(Star):
             results, nickname = await self.api.do_full_sign_in(token)
             now = datetime.now()
 
-            # 复用既有记录，避免覆盖丢失 token / last_sign 等字段
+            # 取既有记录，避免覆盖丢失 token / last_sign 等字段
             user_data = users.get(user_id) or {}
             user_data["last_username"] = user_name
             user_data["bound_at"] = user_data.get("bound_at") or now.isoformat()
@@ -1280,16 +1297,6 @@ class SklandPlugin(Star):
             umo_map[platform] = event.unified_msg_origin
             user_data["umo_by_platform"] = umo_map
             user_data["umo"] = event.unified_msg_origin
-
-            # 复用记录时，为当前平台的 sender_id 建立一条轻量别名记录，
-            # 使其能通过 _resolve_user_key 解析到这条主记录。
-            # 别名记录不含 token，签到名单遍历时会自动跳过。
-            sender_id = event.get_sender_id()
-            if sender_id and sender_id != user_id and sender_id not in users:
-                users[sender_id] = {
-                    "alias": {"uid": user_id},
-                    "last_username": user_name,
-                }
 
             # 每个 token 是一个独立账号：同 token 视为更新，新 token 追加
             is_new_account = self._find_account_by_token(user_data, token) is None
@@ -1316,17 +1323,27 @@ class SklandPlugin(Star):
 
             users[user_id] = user_data
 
-            # 复用记录时，需要把当前平台的绑定也挂到这条记录上
-            if duplicate_of and duplicate_of != user_id:
-                groups = await self.get_kv_data("groups", {})
-                for meta in groups.values():
-                    if not isinstance(meta, dict):
-                        continue
-                    members = meta.get("members") or []
-                    if user_id not in members:
-                        members.append(user_id)
-                        meta["members"] = members
-                await self.put_kv_data("groups", groups)
+            # merge 模式下当前 sender 可能另有一条记录，需要合并删除，
+            # 否则会出现两条用户记录；同时把群成员里的旧键换掉
+            sender_id = event.get_sender_id()
+            if (sender_id and sender_id != user_id and sender_id in users):
+                other = users.get(sender_id) or {}
+                if not other.get("alias"):
+                    for acc in self._get_accounts(other):
+                        if acc.get("token"):
+                            self._upsert_account(user_data, dict(acc))
+                    users.pop(sender_id, None)
+                    groups = await self.get_kv_data("groups", {})
+                    for meta in groups.values():
+                        if not isinstance(meta, dict):
+                            continue
+                        members = meta.get("members") or []
+                        if sender_id in members:
+                            members.remove(sender_id)
+                            if user_id not in members:
+                                members.append(user_id)
+                            meta["members"] = members
+                    await self.put_kv_data("groups", groups)
 
             await self.put_kv_data("users", users)
 
@@ -1340,15 +1357,7 @@ class SklandPlugin(Star):
                 )
 
             # 群聊场景：立即撤回含 token 的那条消息，避免被他人看到
-            recall_note = ""
-            if is_group:
-                recalled, reason = await self._recall_message(event)
-                if recalled:
-                    recall_note = "\n\n🔒 已撤回你发送的 token 消息"
-                else:
-                    recall_note = (
-                        f"\n\n⚠️ 撤回失败{reason}，请手动删除你发送的那条消息"
-                    )
+            recall_note = await self._recall_and_note(event, is_group)
 
             notice = "" if self._can_push(platform) else \
                 "\n\n（当前平台不支持主动推送，将在你查询时展示结果）"
@@ -1363,9 +1372,8 @@ class SklandPlugin(Star):
         except Exception as e:
             logger.error(f"skdlogin失败: {e}")
             # 失败时也要撤回，防止 token 留在群里
-            if is_group:
-                await self._recall_message(event)
-            yield event.plain_result(f"登录失败: {e}")
+            recall_note = await self._recall_and_note(event, is_group)
+            yield event.plain_result(f"登录失败: {e}{recall_note}")
 
     # 官方错误码 → 用户可读提示
     _RECALL_ERROR_HINTS = {
@@ -1374,6 +1382,21 @@ class SklandPlugin(Star):
         "40061001": "请求参数无效",
         "50065001": "撤回失败，请稍后重试",
     }
+
+    async def _recall_and_note(self, event: AstrMessageEvent, is_group: bool) -> str:
+        """
+        撤回含 token 的那条消息，并返回给用户的提示文案。
+
+        群聊场景下，只要用户提交过 token，无论登录成功、失败还是被拒绝，
+        都必须撤回原消息 —— token 等同账号密码，留在群里会被他人看到。
+        各退出路径统一走这里，避免遗漏。
+        """
+        if not is_group:
+            return ""
+        recalled, reason = await self._recall_message(event)
+        if recalled:
+            return "\n\n🔒 已撤回你发送的 token 消息"
+        return f"\n\n⚠️ 撤回失败{reason}，请手动删除你发送的那条消息"
 
     async def _recall_message(self, event: AstrMessageEvent) -> tuple[bool, str]:
         """
@@ -1509,6 +1532,49 @@ class SklandPlugin(Star):
         if signed == len(states):
             return "all"
         return "part"
+
+    def _collect_game_entries(self, accounts: list, game_key: str, game_name: str,
+                              user_data: dict) -> tuple[list[str], list[bool],
+                                                      list[str]]:
+        """
+        收集多个账号在某游戏上的角色名、签到状态与奖励。
+
+        同名角色会合并：同一个人可能有多��森空岛账号，它们绑定的
+        方舟角色名可能相同（如不同服务器/渠道服上的同名角色）。
+        显示时同名只出现一次，状态取「任一已签即为已签」，奖励去重合并。
+
+        返回 (角色名列表, 状态列表, 奖励列表)
+        """
+        names: list[str] = []
+        states: list[bool] = []
+        awards: list[str] = []
+
+        for account in accounts:
+            last_sign = account.get("last_sign") or {}
+            names_map = account.get("game_names") or {}
+            awards_map = account.get("game_awards") or {}
+            nick = self._display_name(account.get("nickname", ""), user_data)
+            signed = bool(last_sign.get(game_key))
+            name = names_map.get(game_name) or (nick if signed else "")
+            if not name:
+                continue
+            items = [str(a) for a in (awards_map.get(game_name) or []) if a]
+
+            if name in names:
+                idx = names.index(name)
+                # 状态取并集：任一账号签了就算这个角色签了
+                states[idx] = states[idx] or signed
+                for it in items:
+                    if it not in awards:
+                        awards.append(it)
+            else:
+                names.append(name)
+                states.append(signed)
+                for it in items:
+                    if it not in awards:
+                        awards.append(it)
+
+        return names, states, awards
 
     @staticmethod
     def _normalize_state(state) -> str:
@@ -1677,27 +1743,12 @@ class SklandPlugin(Star):
                 users_data[uid] = user_data
 
             # 汇总该用户所有账号在两个游戏上的昵称、签到状态与奖励
-            ak_names, ak_states = [], []
-            ef_names, ef_states = [], []
-            ak_awards, ef_awards = [], []
-            for account in accounts:
-                last_sign = account.get("last_sign") or {}
-                names = account.get("game_names") or {}
-                awards_map = account.get("game_awards") or {}
-                fallback = self._display_name(account.get("nickname", ""), user_data)
-
-                ak_signed = bool(last_sign.get("arknights"))
-                ef_signed = bool(last_sign.get("endfield"))
-                ak_name = names.get("arknights") or (fallback if ak_signed else "")
-                ef_name = names.get("endfield") or (fallback if ef_signed else "")
-                if ak_name:
-                    ak_names.append(ak_name)
-                    ak_states.append(ak_signed)
-                    ak_awards.extend(awards_map.get("arknights") or [])
-                if ef_name:
-                    ef_names.append(ef_name)
-                    ef_states.append(ef_signed)
-                    ef_awards.extend(awards_map.get("endfield") or [])
+            # 汇总该用户所有账号在两个游戏上的昵称、签到状态与奖励
+            # 同名角色会合并（不同账号/服务器可能重名），避免列表出现重复
+            ak_names, ak_states, ak_awards = self._collect_game_entries(
+                accounts, "arknights", "arknights", user_data)
+            ef_names, ef_states, ef_awards = self._collect_game_entries(
+                accounts, "endfield", "endfield", user_data)
 
             if not ak_names and not ef_names:
                 continue
@@ -1757,7 +1808,8 @@ class SklandPlugin(Star):
     # 群聊状态表的列宽（按显示宽度，中文占 2 列）
     _GAME_COL = 15
     _STATE_COL = 5
-    _NAME_MAX = 20
+    # 角色名列宽度：多账号时会有多个名字用 / 分隔，需要留足空间
+    _NAME_MAX = 30
 
     def _render_group_status(self, rows: list) -> str:
         """

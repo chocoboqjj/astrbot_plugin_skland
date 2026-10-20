@@ -116,6 +116,10 @@ QQ 官方机器人与 OneBot 的能力差异较大，本插件会**自动识别�
 - 撤回走的是官方接口
   [`DELETE /v2/groups/{group_openid}/messages/{message_id}`](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages_message_id.delete.html)
 
+**只要消息里带了 token，无论结果如何都会撤回** —— 包括登录成功、
+接口异常、达到用户数上限、token 已被他人绑定等所有退出路径。
+每条回复末尾都会附上撤回结果（成功或失败原因），失败时请手动删除原消息。
+
 **撤回的官方前提条件**（不满足则撤回失败）：
 
 | 条件 | 不满足时的错误码 | 插件提示 |
@@ -154,6 +158,30 @@ QQ 官方机器人与 OneBot 的能力差异较大，本插件会**自动识别�
 | `live_query_in_group` | `false` | 群聊 `/skd` 是否实时请求森空岛 |
 | `card_image_enabled` | `false` | `/skd` 以图片卡片输出签到状态 |
 | `card_theme` | `dark` | `dark` 深色 / `light` 浅色卡片 |
+| `token_conflict` | `smart` | 已绑定的 token 被再次绑定时如何处理 |
+
+### token 冲突处理
+
+**只支持 QQ 官方平台**，sender_id 即稳定的 openid，因此「token 已绑在别的用户下」
+即可断定是他人冒用/共享，**默认一律拒绝**。
+
+| 配置 | 行为 |
+|------|------|
+| `reject`（默认） | 一律拒绝，并提示当前绑定者与处理途径 |
+| `merge` | 自动复用原记录，仅用于管理员清理历史重复数据 |
+
+被拒绝时：
+
+```
+❌ 绑定失败：该森空岛账号已被其他用户绑定
+
+• 当前绑定者：玩家甲
+• 如果这是你自己的账号，请用当前 QQ 重新登录，
+  或联系管理员使用 /skdmerge 合并记录
+• 如果是账号共享，请让各自使用自己的 token
+```
+
+> 历史遗留的重复数据用 `/skdmerge` 一次性清理（仅管理员）。
 
 > 群聊 `/skd` 默认**读取数据库**中的最近一次签到结果，不产生额外请求。
 

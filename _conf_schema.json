@@ -73,5 +73,11 @@
       "light"
     ],
     "hint": "dark=深色卡片 / light=浅色卡片，仅在启用图片卡片时生效"
+  },
+  "token_conflict": {
+    "description": "token 冲突处理",
+    "type": "string",
+    "default": "reject",
+    "hint": "已绑定的 token 被再次绑定时如何处理：reject=一律拒绝（推荐，仅支持 QQ 官方平台）；merge=自动复用原记录，用于清理历史重复数据"
   }
 }
