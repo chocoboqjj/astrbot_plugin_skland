@@ -87,6 +87,8 @@ class SklandPlugin(Star):
         self.api = SklandAPI(max_retries=3)
         self.scheduler = AsyncIOScheduler()
         self._card = CardRenderer(theme=self.config.get("card_theme", "dark"))
+        # 已提示过「无撤回权限」的群，避免每次登录都重复刷 WARN 日志
+        self._recall_denied_groups: set[str] = set()
         self._init_config()
     # ==================== Config ====================
 
@@ -1376,8 +1378,11 @@ class SklandPlugin(Star):
             yield event.plain_result(f"登录失败: {e}{recall_note}")
 
     # 官方错误码 → 用户可读提示
+    # 40062003 是线上最常见的情况：机器人不是群管理员，撤不掉普通成员的消息。
+    # 这是官方硬限制，唯一的解法是把机器人设为群管理员，因此提示里直接给出操作指引。
     _RECALL_ERROR_HINTS = {
-        "40062003": "机器人不是群管理员，无权撤回他人消息",
+        "40062003": "机器人不是群管理员，无权撤回他人消息。"
+                    "请群主在群聊设置里把机器人添加为管理员，否则无法撤回",
         "40064004": "消息发送已超过 2 分钟，官方接口不允许撤回",
         "40061001": "请求参数无效",
         "50065001": "撤回失败，请稍后重试",
@@ -1396,7 +1401,12 @@ class SklandPlugin(Star):
         recalled, reason = await self._recall_message(event)
         if recalled:
             return "\n\n🔒 已撤回你发送的 token 消息"
-        return f"\n\n⚠️ 撤回失败{reason}，请手动删除你发送的那条消息"
+        # 撤回失败意味着 token 仍暴露在群里，提示要说清严重性和即时动作
+        return (
+            f"\n\n⚠️ 撤回失败{reason}\n"
+            "🔴 你的 token 仍显示在群里，请立即手动撤回该消息！\n"
+            "💡 建议改用私聊发送 /skdlogin，私聊内容不会留在群里"
+        )
 
     async def _recall_message(self, event: AstrMessageEvent) -> tuple[bool, str]:
         """
@@ -1445,9 +1455,25 @@ class SklandPlugin(Star):
                     hint = desc
                     break
             reason = f"（{hint}）" if hint else ""
+            # 40062003 是权限问题，日志里直接给出解法，避免反复排查。
+            # 该问题不会自愈，同一群体内只详细提示一次，避免刷屏。
+            fix = ""
+            if "40062003" in text:
+                fix = "。解法：把机器人设为该群管理员（群聊设置 → 管理 → 添加管理员）"
+                denied = getattr(self, "_recall_denied_groups", None)
+                if denied is None:
+                    denied = set()
+                    self._recall_denied_groups = denied
+                if group_openid in denied:
+                    logger.warning(
+                        f"[森空岛] 群 {group_openid} 撤回仍无权限"
+                        "（机器人非群管理员），已提示过，此处从略"
+                    )
+                    return False, reason
+                denied.add(group_openid)
             logger.warning(
-                f"[森空岛] 撤回群消息失败（群 {group_openid} 消息 {message_id}）：{e}{reason}。"
-                "请手动删除该条消息"
+                f"[森空岛] 撤回群消息失败（群 {group_openid} 消息 {message_id}）："
+                f"{e}{reason}{fix}。token 仍暴露在群里，已提示用户手动撤回"
             )
             return False, reason
 
