@@ -226,6 +226,29 @@ class CardRenderer:
                 self._font_cache[key] = ImageFont.truetype(self.font_path, size)
         return self._font_cache[key]
 
+    def _fit_text(self, d, text: str, max_px: int, size: int,
+                  bold: bool = False, min_size: int = 14) -> tuple[str, int]:
+        """
+        让文本适配给定像素宽度。
+
+        优先**缩小字号**让内容完整显示（名字被截断会丢失信息），
+        只有缩到最小字号仍放不下时才截断并加省略号。
+
+        返回 (最终文本, 实际使用的字号)。
+        """
+        if not text or max_px <= 0:
+            return "", size
+        if d.textlength(text, font=self._font(size, bold)) <= max_px:
+            return text, size
+
+        # 逐级缩小字号，优先保证内容完整
+        for s in range(size - 1, min_size - 1, -1):
+            if d.textlength(text, font=self._font(s, bold)) <= max_px:
+                return text, s
+
+        # 缩到最小仍放不下，才截断
+        return self._ellipsize(d, text, max_px, min_size, bold), min_size
+
     def _ellipsize(self, d, text: str, max_px: int, size: int,
                    bold: bool = False) -> str:
         """
@@ -421,14 +444,14 @@ class CardRenderer:
                 else:
                     x += 4
 
-                # 角色名：按实际像素宽度截断，多账号时不会溢出画布
+                # 角色名：优先缩小字号完整显示，放不下才截断
                 # 两个游戏之间用「｜」分隔，与账号间的「/」区分
                 label = ak_name
                 if ef_name:
                     label = f"{label} ｜ {ef_name}" if label else ef_name
                 max_px = W - PAD - x
-                label = self._ellipsize(d, label, max_px, 23, bold=True)
-                self._text(d, (x, y), label, 23, c["text"], bold=True)
+                label, label_size = self._fit_text(d, label, max_px, 23, bold=True)
+                self._text(d, (x, y), label, label_size, c["text"], bold=True)
 
                 y += ROW
 
@@ -448,8 +471,9 @@ class CardRenderer:
                     award_text = " ｜ ".join(parts)
                     award_x = PAD + 58
                     award_px = W - PAD - award_x
-                    award_text = self._ellipsize(d, award_text, award_px, 15)
-                    self._text(d, (award_x, y - 2), award_text, 15, c["muted"])
+                    award_text, award_size = self._fit_text(
+                        d, award_text, award_px, 15, min_size=11)
+                    self._text(d, (award_x, y - 2), award_text, award_size, c["muted"])
                     y += AWARD_H
 
             d.rectangle([PAD, H - 64, W - PAD, H - 63], fill=c["div"])
