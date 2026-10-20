@@ -3,17 +3,43 @@
 
 生成群聊/私聊的签到状态卡片图片。依赖 Pillow 与中文字体，
 两者任一缺失时调用方应回退到纯文本输出。
+
+字体：随插件打包了「筑紫A丸 + Google Sans 圆润版」（fonts/ 目录），
+无需依赖系统字体，各平台渲染效果一致。
 """
 
+import glob
 import os
 import tempfile
 from typing import Optional
 
-# 中文字体候选路径（覆盖 macOS / Linux / Windows 常见位置）
-FONT_CANDIDATES = [
+# 插件目录（用于查找随插件打包的字体）
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+_PACKAGED_FONT_DIR = os.path.join(_PLUGIN_DIR, "fonts")
+
+# 随插件打包的字体（放在 plugins/astrbot_plugin_skland/fonts/ 下）
+_PACKAGED_FONTS = [
+    "ChikugoMaruGothic-Bold.ttf",
+    "NotoSansSC-Regular.otf",
+    "NotoSansSC-Bold.otf",
+    "NotoSansSC-Regular.ttf",
+    "NotoSansSC-Bold.ttf",
+]
+
+# 用户本机安装的中文字体（打包字体缺失时的兜底）
+_USER_FONT_DIRS = [
+    os.path.expanduser("~/Library/Fonts"),   # macOS
+    os.path.expanduser("~/.fonts"),            # Linux 用户级
+    os.path.expanduser("~/.local/share/fonts"),  # Linux 用户级
+    os.path.expanduser(r"%LOCALAPPDATA%\Microsoft\Windows\Fonts"),  # Windows
+]
+
+# 系统级中文字体候选（最后的兜底）
+_SYSTEM_FONTS = [
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
     "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/Supplemental/Songti.ttc",
     "/Library/Fonts/Arial Unicode.ttf",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
@@ -22,6 +48,70 @@ FONT_CANDIDATES = [
     "C:/Windows/Fonts/msyh.ttc",
     "C:/Windows/Fonts/simhei.ttf",
 ]
+
+
+def _find_packaged_font() -> Optional[str]:
+    """查找随插件打包的字体"""
+    if not os.path.isdir(_PACKAGED_FONT_DIR):
+        return None
+    for name in _PACKAGED_FONTS:
+        path = os.path.join(_PACKAGED_FONT_DIR, name)
+        if os.path.exists(path):
+            return path
+    # 兜底：目录下任意 ttf/otf/ttc
+    for pattern in ("*.otf", "*.ttf", "*.ttc"):
+        hits = sorted(glob.glob(os.path.join(_PACKAGED_FONT_DIR, pattern)))
+        if hits:
+            return hits[0]
+    return None
+
+
+def _find_user_font() -> Optional[str]:
+    """查找用户本机安装的中文字体"""
+    for directory in _USER_FONT_DIRS:
+        if not os.path.isdir(directory):
+            continue
+        for pattern in ("*.ttc", "*.otf", "*.ttf"):
+            for path in sorted(glob.glob(os.path.join(directory, pattern))):
+                if _is_cjk_font(path):
+                    return path
+    return None
+
+
+def _is_cjk_font(path: str) -> bool:
+    """粗略判断字体是否包含中文字形（避免选到纯西文字体）"""
+    try:
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(path, fontNumber=0, lazy=True)
+        cmap = font.getBestCmap()
+        # 「森」是卡片里必然出现的字
+        has_cjk = 0x68EE in cmap
+        font.close()
+        return has_cjk
+    except Exception:
+        # fontTools 不可用时不做判断，交由调用方验证
+        return True
+
+
+def _find_font() -> Optional[str]:
+    """
+    按优先级查找中文字体：
+    1. 随插件打包的字体（保证各平台渲染效果一致）
+    2. 用户本机安装的中文字体
+    3. 系统级字体
+    """
+    for finder in (_find_packaged_font, _find_user_font):
+        try:
+            path = finder()
+        except Exception:
+            path = None
+        if path:
+            return path
+    for path in _SYSTEM_FONTS:
+        if os.path.exists(path):
+            return path
+    return None
 
 # 深色主题配色
 THEME_DARK = {
@@ -52,13 +142,6 @@ THEME_LIGHT = {
 GAME_LABELS = (("明日方舟", "arknights"), ("终末地", "endfield"))
 
 
-def _find_font() -> Optional[str]:
-    for path in FONT_CANDIDATES:
-        if os.path.exists(path):
-            return path
-    return None
-
-
 def _pick_bold_index(font_path: str) -> int:
     """在 ttc 字体集中挑一个加粗字重，返回 index"""
     try:
@@ -75,6 +158,25 @@ def _pick_bold_index(font_path: str) -> int:
     return 0
 
 
+def _has_multiple_weights(font_path: str) -> bool:
+    """
+    判断字体是否包含多个字重。
+
+    打包的筑紫A丸是单字重 Bold 字体，此时加粗与常规需靠渲染技巧区分。
+    """
+    try:
+        from PIL import ImageFont
+    except ImportError:
+        return False
+    names = set()
+    for i in range(4):
+        try:
+            names.add(str(ImageFont.truetype(font_path, 20, index=i).getname()))
+        except Exception:
+            break
+    return len(names) > 1
+
+
 class CardRenderer:
     """签到状态卡片渲染器"""
 
@@ -83,6 +185,10 @@ class CardRenderer:
         self.theme = THEME_LIGHT if theme == "light" else THEME_DARK
         self.font_path = _find_font()
         self.bold_index = _pick_bold_index(self.font_path) if self.font_path else 0
+        # 单字重字体需要用「挖细」技巧模拟轻字重
+        self._has_single_weight = bool(
+            self.font_path and not _has_multiple_weights(self.font_path)
+        )
         self._font_cache = {}
 
     @property
@@ -106,6 +212,23 @@ class CardRenderer:
             except Exception:
                 self._font_cache[key] = ImageFont.truetype(self.font_path, size)
         return self._font_cache[key]
+
+    def _text(self, d, xy, text: str, size: int, color, bold: bool = False,
+              anchor: str = "la") -> None:
+        """
+        绘制文本。
+
+        随插件打包的筑紫A丸只有一个 Bold 字重，若直接用它渲染全部文字，
+        标题/正文/辅助信息的层级就拉不开了。这里对「非加粗」文本用
+        背景色描边做一次「挖细」，视觉上得到轻字重的效果。
+        背景为纯色，描边不会留下杂边。
+        """
+        font = self._font(size, bold)
+        if not bold and self._has_single_weight:
+            bg = self.theme["bg"]
+            d.text(xy, text, font=font, fill=bg, stroke_width=1, stroke_fill=bg,
+                   anchor=anchor)
+        d.text(xy, text, font=font, fill=color, anchor=anchor)
 
     @staticmethod
     def _check(d, x, y, size, color):
@@ -159,16 +282,16 @@ class CardRenderer:
                 d.rectangle([0, i, W, i + 1], fill=c["accent"])
 
             # 标题
-            d.text((PAD, 34), title, font=self._font(36, True), fill=c["text"])
-            d.text((PAD + 2, 82), subtitle, font=self._font(16), fill=c["muted"])
+            self._text(d, (PAD, 34), title, 36, c["text"], bold=True)
+            self._text(d, (PAD + 2, 82), subtitle, 16, c["muted"])
 
             # 右上统计：按「人」计数（与底部汇总口径一致）
             signed = sum(1 for r in rows if r.get("arknights") or r.get("endfield"))
             stat = f"{signed}/{len(rows)}"
             sw = d.textlength(stat, font=self._font(34, True))
-            d.text((W - PAD - sw, 34), stat, font=self._font(34, True), fill=c["accent"])
+            self._text(d, (W - PAD - sw, 34), stat, 34, c["accent"], bold=True)
             lw = d.textlength("已签到", font=self._font(15))
-            d.text((W - PAD - lw, 78), "已签到", font=self._font(15), fill=c["muted"])
+            self._text(d, (W - PAD - lw, 78), "已签到", 15, c["muted"])
 
             d.rectangle([PAD, 118, W - PAD, 119], fill=c["div"])
 
@@ -202,20 +325,18 @@ class CardRenderer:
                     (self._check if ak_ok else self._cross)(d, x, y + 5, 20,
                                                           c["ok"] if ak_ok else c["bad"])
                     x += 30
-                    d.text((x, y + 3), "明日方舟", font=self._font(20),
-                           fill=c["text"] if ak_ok else c["muted"])
+                    self._text(d, (x, y + 3), "明日方舟", 20, c["text"] if ak_ok else c["muted"])
                     x += 96
 
                 if ef_name:
                     if ak_name:
                         # 斜杠
-                        d.text((x - 8, y + 3), "/", font=self._font(20), fill=c["muted"])
+                        self._text(d, (x - 8, y + 3), "/", 20, c["muted"])
                         x += 18
                     (self._check if ef_ok else self._cross)(d, x, y + 5, 20,
                                                           c["ok"] if ef_ok else c["bad"])
                     x += 30
-                    d.text((x, y + 3), "终末地", font=self._font(20),
-                           fill=c["text"] if ef_ok else c["muted"])
+                    self._text(d, (x, y + 3), "终末地", 20, c["text"] if ef_ok else c["muted"])
                     x += 96
                 else:
                     x += 4
@@ -225,7 +346,7 @@ class CardRenderer:
                 if ef_name:
                     ef_short = ef_name[:20] if len(ef_name) > 20 else ef_name
                     label = f"{label} / {ef_short}" if label else ef_short
-                d.text((x, y), label, font=self._font(23, True), fill=c["text"])
+                self._text(d, (x, y), label, 23, c["text"], bold=True)
 
                 # 奖励按游戏归属，各自显示在对应游戏名下方
                 ak_awards = r.get("ak_awards") or []
@@ -238,13 +359,9 @@ class CardRenderer:
                     game_col = PAD + 58
                     ef_col = game_col + 96 + 18
                     if ak_awards:
-                        d.text((game_col, y + 32),
-                               "  ".join(str(a) for a in ak_awards),
-                               font=self._font(15), fill=c["muted"])
+                        self._text(d, (game_col, y + 32), "  ".join(str(a) for a in ak_awards), 15, c["muted"])
                     if ef_awards:
-                        d.text((ef_col, y + 32),
-                               "  ".join(str(a) for a in ef_awards),
-                               font=self._font(15), fill=c["muted"])
+                        self._text(d, (ef_col, y + 32), "  ".join(str(a) for a in ef_awards), 15, c["muted"])
 
                 y += ROW
 
@@ -254,11 +371,11 @@ class CardRenderer:
                        if r.get("arknights") and (r.get("ak_name") or r.get("name")))
             ef_c = sum(1 for r in rows
                        if r.get("endfield") and (r.get("ef_name") or r.get("ak_name")))
-            d.text((PAD, H - 48), f"明日方舟 {ak_c} 人", font=self._font(19), fill=c["muted"])
-            d.text((PAD + 160, H - 48), f"终末地 {ef_c} 人", font=self._font(19), fill=c["muted"])
+            self._text(d, (PAD, H - 48), f"明日方舟 {ak_c} 人", 19, c["muted"])
+            self._text(d, (PAD + 160, H - 48), f"终末地 {ef_c} 人", 19, c["muted"])
             footer = "Created By 梅莉"
             tw = d.textlength(footer, font=self._font(15))
-            d.text((W - PAD - tw, H - 45), footer, font=self._font(15), fill=c["foot"])
+            self._text(d, (W - PAD - tw, H - 45), footer, 15, c["foot"])
 
             fd, path = tempfile.mkstemp(prefix="skland_card_", suffix=".png")
             os.close(fd)

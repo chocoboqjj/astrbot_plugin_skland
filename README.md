@@ -87,27 +87,25 @@ QQ 官方机器人与 OneBot 的能力差异较大，本插件会**自动识别�
 
 开启 `card_image_enabled` 后，`/skd` 会输出一张签到状态卡片图片（附纯文本备用信息）。
 
-渲染需要两个条件，**缺一不可**：
+渲染只需要 **Pillow**（已在 `requirements.txt` 中列出，AstrBot 会自动安装）—— 字体已随插件打包，**无需在系统安装中文字体**，各平台渲染效果一致。
 
-1. **Pillow** —— 已在 `requirements.txt` 中列出，AstrBot 会自动安装
-2. **系统中文字体** —— 插件会自动在常见路径查找：
+字体查找优先级：
 
-| 系统 | 字体 |
-|------|------|
-| macOS | `/System/Library/Fonts/Hiragino Sans GB.ttc` |
-| Linux | `/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc`、`NotoSansCJK-Regular.ttc` |
-| Windows | `C:/Windows/Fonts/msyh.ttc`、`simhei.ttf` |
+1. 插件内置字体（`fonts/` 目录）—— 跨平台效果一致
+2. 用户本机安装的中文字体（`~/Library/Fonts`、`~/.fonts` 等）
+3. 系统级中文字体（`Hiragino Sans GB`、`NotoSansCJK`、`wqy-zenhei` 等）
 
-> ⚠️ **Docker 部署注意**：精简镜像常常不带中文字体，表现为卡片文字变成方块或直接不渲染。解决方式：
-> ```dockerfile
-> # Debian/Ubuntu
-> RUN apt-get update && apt-get install -y fonts-noto-cjk && rm -rf /var/lib/apt/lists/*
-> ```
-> ```dockerfile
-> # Alpine
-> RUN apk add --no-cache font-noto-cjk
-> ```
+> ⚠️ **字体许可提示**
 >
+> 内置的筑紫A丸（BC筑紫S丸SC Bold）是 **Fontworks 的商业字体**，
+> 并非 OFL 等自由许可。随插件对外分发可能违反其授权条款。
+>
+> 若要公开发布到插件市场，建议把 `fonts/` 里的字体换成
+> Noto Sans SC / Sarasa Gothic SC 等开源字体，或直接删除 `fonts/` 目录
+> （插件会自动回退到查找系统字体）。详见 `fonts/README.md`。
+
+> 💡 发送 `/skdcheck` 可查看当前使用的字体与渲染自检结果。
+
 > **字体缺失或 Pillow 未安装时，插件会自动回退为纯文本输出**，不会报错也不会影响签到功能。
 
 ### 图片没出来？先跑 /skdcheck

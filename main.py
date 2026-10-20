@@ -707,11 +707,12 @@ class SklandPlugin(Star):
         lines.append(f"Pillow: {'✅ 已安装 ' + pillow_ver if has_pillow else '❌ 未安装'}")
         if not has_pillow:
             lines.append("　　→ 执行 pip install Pillow")
-        lines.append(f"中文字体: {'✅ ' + card.font_path if has_font else '❌ 未找到'}")
-        if not has_font:
-            lines.append("　　→ Debian/Ubuntu: apt install fonts-noto-cjk")
-            lines.append("　　→ Alpine: apk add font-noto-cjk")
-            lines.append("　　→ 或在 config/ 中放置任意中文字体 ttf/ttc")
+        lines.append(f"中文字体: {'✅ 已找到' if has_font else '❌ 未找到'}")
+        if has_font:
+            lines.append(f"　　→ {card.font_path}")
+        else:
+            lines.append("　　→ 插件已内置字体，请确认 fonts/ 目录完整")
+            lines.append("　　→ 或在系统中安装中文字体（fonts-noto-cjk 等）")
 
         if enabled and has_pillow and has_font:
             test_rows = [{
