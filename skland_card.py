@@ -226,6 +226,29 @@ class CardRenderer:
                 self._font_cache[key] = ImageFont.truetype(self.font_path, size)
         return self._font_cache[key]
 
+    def _ellipsize(self, d, text: str, max_px: int, size: int,
+                   bold: bool = False) -> str:
+        """
+        按实际像素宽度截断文本，超出时以省略号结尾。
+
+        不能按字符数截断：中文与英文的像素宽度差异很大，
+        多账号时名字累加会超出画布宽度。
+        """
+        if not text or max_px <= 0:
+            return ""
+        font = self._font(size, bold)
+        if d.textlength(text, font=font) <= max_px:
+            return text
+        ellipsis = "…"
+        ell_w = d.textlength(ellipsis, font=font)
+        # 逐字符裁剪，直到能放下省略号
+        out = ""
+        for ch in text:
+            if d.textlength(out + ch, font=font) + ell_w > max_px:
+                break
+            out += ch
+        return (out + ellipsis) if out else ellipsis
+
     def _text(self, d, xy, text: str, size: int, color, bold: bool = False,
               anchor: str = "la") -> None:
         """
@@ -299,13 +322,24 @@ class CardRenderer:
         try:
             c = self.theme
             W, PAD, ROW = 720, 44, 54
+            AWARD_H = 26  # 奖励行高度
 
-            # 一个人占一行，先算行数再决定画布高度
-            entry_count = sum(
-                1 for r in rows
-                if r.get("ak_name") or r.get("ef_name") or r.get("name")
-            )
-            H = 150 + max(entry_count, 1) * ROW + 62
+            # 一个人占一行（ROW），有奖励的额外占一行（AWARD_H）
+            base_rows = 0
+            award_rows = 0
+            for r in rows:
+                ak_names = r.get("ak_names")
+                ef_names = r.get("ef_names")
+                if ak_names is None and ef_names is None:
+                    ak_names = [r.get("ak_name") or ""] if r.get("ak_name") else []
+                    ef_names = [r.get("ef_name") or ""] if r.get("ef_name") else []
+                has_name = any(ak_names) or any(ef_names) or r.get("name")
+                if not has_name:
+                    continue
+                base_rows += 1
+                if r.get("ak_awards") or r.get("ef_awards") or r.get("awards"):
+                    award_rows += 1
+            H = 150 + base_rows * ROW + award_rows * AWARD_H + 62
 
             img = Image.new("RGB", (W, H), c["bg"])
             d = ImageDraw.Draw(img)
@@ -330,9 +364,8 @@ class CardRenderer:
 
             d.rectangle([PAD, 118, W - PAD, 119], fill=c["div"])
 
-            # 按游戏分行：一个账号可同时绑定两个游戏，角色名往往不同，
-            # 因此每个游戏各占一行，名字紧跟所属游戏，避免张冠李戴。
             # 一个人一行：两个游戏用斜杠横向合并，勾叉与名字一一对应
+            # 奖励另起一行显示（不与名字对齐），两个游戏的奖励用「｜」分隔
             y = 142
             for r in rows:
                 # 角色名列表：同游戏内多个账号用「/」分隔
@@ -388,16 +421,36 @@ class CardRenderer:
                 else:
                     x += 4
 
-                # 角色名：两个游戏之间用「｜」分隔，与账号间的「/」区分
-                label = ak_name[:20] if len(ak_name) > 20 else ak_name
+                # 角色名：按实际像素宽度截断，多账号时不会溢出画布
+                # 两个游戏之间用「｜」分隔，与账号间的「/」区分
+                label = ak_name
                 if ef_name:
-                    ef_short = ef_name[:20] if len(ef_name) > 20 else ef_name
-                    label = f"{label} ｜ {ef_short}" if label else ef_short
+                    label = f"{label} ｜ {ef_name}" if label else ef_name
+                max_px = W - PAD - x
+                label = self._ellipsize(d, label, max_px, 23, bold=True)
                 self._text(d, (x, y), label, 23, c["text"], bold=True)
 
-                # 奖励按游戏归属，各自显示在对应游戏名下方
-                # 奖励道具名称不展示
                 y += ROW
+
+                # 奖励另起一行：两个游戏的奖励用「｜」分隔，不做列对齐
+                ak_awards = [str(a) for a in (r.get("ak_awards") or []) if a]
+                ef_awards = [str(a) for a in (r.get("ef_awards") or []) if a]
+                if not ak_awards and not ef_awards:
+                    # 兼容旧数据：只有单一 awards 字段时归到方舟
+                    single = r.get("awards") or []
+                    ak_awards = [str(a) for a in single if a]
+                if ak_awards or ef_awards:
+                    parts = []
+                    if ak_awards:
+                        parts.append("、".join(ak_awards))
+                    if ef_awards:
+                        parts.append("、".join(ef_awards))
+                    award_text = " ｜ ".join(parts)
+                    award_x = PAD + 58
+                    award_px = W - PAD - award_x
+                    award_text = self._ellipsize(d, award_text, award_px, 15)
+                    self._text(d, (award_x, y - 2), award_text, 15, c["muted"])
+                    y += AWARD_H
 
             d.rectangle([PAD, H - 64, W - PAD, H - 63], fill=c["div"])
             # 统计按实际绑定的游戏计数，未绑定某游戏的不计入

@@ -14,8 +14,8 @@
   "auto_sign_hour": {
     "description": "自动签到时间（小时）",
     "type": "int",
-    "default": 9,
-    "hint": "自动签到执行的小时（0-23），默认早上9点"
+    "default": 0,
+    "hint": "自动签到执行的小时（0-23），默认 0 点（每日 0 点重置签到状态并执行签到）"
   },
   "auto_sign_delay": {
     "description": "自动签到的延迟，防止风控",
@@ -33,7 +33,11 @@
     "description": "推送模式",
     "type": "string",
     "default": "auto",
-    "options": ["auto", "private", "pull"],
+    "options": [
+      "auto",
+      "private",
+      "pull"
+    ],
     "hint": "auto=按平台自动判断（OneBot 私聊推送，QQ官方仅落库）；private=强制私聊推送；pull=强制仅落库不推送"
   },
   "group_broadcast_enabled": {
@@ -46,7 +50,7 @@
     "description": "群聊实时查询",
     "type": "bool",
     "default": false,
-    "hint": "开启后群聊 /skd 会实时请求森空岛接口，人数多时较慢且请求量大；关闭时直接读取数据库中最近一次的签到结果"
+    "hint": "开启后群聊 /skd 会实时请求森空岛接口；今日已签到的账号会跳过请求直接读取落库结果，跨天自动重置"
   },
   "card_image_enabled": {
     "description": "签到卡片图片",
@@ -58,7 +62,10 @@
     "description": "卡片主题",
     "type": "string",
     "default": "dark",
-    "options": ["dark", "light"],
+    "options": [
+      "dark",
+      "light"
+    ],
     "hint": "dark=深色卡片 / light=浅色卡片，仅在启用图片卡片时生效"
   }
 }

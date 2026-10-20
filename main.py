@@ -94,8 +94,8 @@ class SklandPlugin(Star):
         defaults = [
             ("自动签到开关", "auto_sign_enabled", True,
              "开启后，将在指定时间自动为所有已注册用户签到"),
-            ("自动签到时间（小时）", "auto_sign_hour", 9,
-             "自动签到执行的小时（0-23），默认早上9点"),
+            ("自动签到时间（小时）", "auto_sign_hour", 0,
+             "自动签到执行的小时（0-23），默认 0 点（每日 0 点重置并签到）"),
             ("显示玩家名称", "show_player_name", True,
              "开启后显示森空岛昵称，否则显示平台昵称"),
             ("自动签到的延迟", "auto_sign_delay", 10,
@@ -126,7 +126,7 @@ class SklandPlugin(Star):
         """获取当前配置"""
         return {
             "auto_sign_enabled": self.config.get("auto_sign_enabled", True),
-            "auto_sign_hour": self.config.get("auto_sign_hour", 9),
+            "auto_sign_hour": self.config.get("auto_sign_hour", 0),
             "show_player_name": self.config.get("show_player_name", True),
             "auto_sign_delay": self.config.get("auto_sign_delay", 10),
             "max_users": self.config.get("max_users", 10),
@@ -447,6 +447,17 @@ class SklandPlugin(Star):
         return any(k in error for k in
                    ["已签到", "请勿重复", "重复签到", "already", "签到过", "今日已"])
 
+    @staticmethod
+    def _account_signed_today(account: dict, today: str) -> bool:
+        """
+        判断该账号今天是否已签到。
+
+        last_sign 里存的是签到日期（如 "2026-10-20"），跨天自然不相等，
+        因此每日 0 点后状态自动失效，无需显式重置。
+        """
+        last_sign = account.get("last_sign") or {}
+        return any(v == today for v in last_sign.values())
+
     async def _auto_sign_all_users(self):
         """为所有已注册用户执行自动签到，结果落库，按平台能力决定是否推送"""
         config = self._get_config()
@@ -483,6 +494,13 @@ class SklandPlugin(Star):
             for account in accounts:
                 token = account.get("token")
                 if not token:
+                    continue
+                # 今日已签到则跳过，不重复请求接口
+                if self._account_signed_today(account, today):
+                    logger.info(
+                        f"用户 {user_id} 账号 {account.get('nickname') or '?'} "
+                        f"今日已签到，跳过"
+                    )
                     continue
                 try:
                     results, nickname = await self.api.do_full_sign_in(token)
@@ -667,9 +685,11 @@ class SklandPlugin(Star):
 
         ak_names, ak_states = [], []
         ef_names, ef_states = [], []
+        ak_awards, ef_awards = [], []
         for account in accounts:
             last_sign = account.get("last_sign") or {}
             names = account.get("game_names") or {}
+            awards_map = account.get("game_awards") or {}
             nick = self._display_name(account.get("nickname", ""), user_data)
 
             ak_signed = bool(last_sign.get("arknights"))
@@ -679,16 +699,22 @@ class SklandPlugin(Star):
             if ak_name:
                 ak_names.append(ak_name)
                 ak_states.append(ak_signed)
+                ak_awards.extend(awards_map.get("arknights") or [])
             if ef_name:
                 ef_names.append(ef_name)
                 ef_states.append(ef_signed)
+                ef_awards.extend(awards_map.get("endfield") or [])
 
         return [{
             "name": fallback,
+            "ak_names": ak_names,
+            "ef_names": ef_names,
             "ak_name": "/".join(ak_names),
             "ef_name": "/".join(ef_names),
             "arknights": self._merge_state(ak_states),
             "endfield": self._merge_state(ef_states),
+            "ak_awards": ak_awards,
+            "ef_awards": ef_awards,
         }]
 
     def _render_stored_result(self, user_data: dict) -> str:
@@ -1297,10 +1323,18 @@ class SklandPlugin(Star):
 
             failed = False
             if live:
+                # 逐个账号记录失败：单个账号失败不应隐藏该用户的其他账号
+                failed_accounts = 0
+                queried_accounts = 0
                 for account in accounts:
                     token = account.get("token")
                     if not token:
                         continue
+                    # 今日已签到就不再请求接口，直接读落库结果。
+                    # last_sign 存的是日期，跨天自动失效，等价于每日 0 点重置。
+                    if self._account_signed_today(account, today):
+                        continue
+                    queried_accounts += 1
                     try:
                         results, live_nick = await self.api.do_full_sign_in(token)
                         if live_nick:
@@ -1310,15 +1344,24 @@ class SklandPlugin(Star):
                         self._store_game_awards(account, results)
                     except Exception as e:
                         logger.warning(f"群聊实时查询用户 {uid} 失败: {e}")
-                        failed = True
+                        failed_accounts += 1
+                # 只有当「需要查询的账号全部失败」且「没有任何账号有有效签到结果」
+                # 时，才把整个用户标记为失败；否则仍展示各账号已有的签到状态
+                if queried_accounts > 0 and failed_accounts == queried_accounts:
+                    has_valid = any(
+                        self._account_signed_today(a, today) for a in accounts
+                    )
+                    failed = not has_valid
                 users_data[uid] = user_data
 
-            # 汇总该用户所有账号在两个游戏上的昵称与签到状态
+            # 汇总该用户所有账号在两个游戏上的昵称、签到状态与奖励
             ak_names, ak_states = [], []
             ef_names, ef_states = [], []
+            ak_awards, ef_awards = [], []
             for account in accounts:
                 last_sign = account.get("last_sign") or {}
                 names = account.get("game_names") or {}
+                awards_map = account.get("game_awards") or {}
                 fallback = self._display_name(account.get("nickname", ""), user_data)
 
                 ak_signed = bool(last_sign.get("arknights"))
@@ -1328,9 +1371,11 @@ class SklandPlugin(Star):
                 if ak_name:
                     ak_names.append(ak_name)
                     ak_states.append(ak_signed)
+                    ak_awards.extend(awards_map.get("arknights") or [])
                 if ef_name:
                     ef_names.append(ef_name)
                     ef_states.append(ef_signed)
+                    ef_awards.extend(awards_map.get("endfield") or [])
 
             if not ak_names and not ef_names:
                 continue
@@ -1347,6 +1392,9 @@ class SklandPlugin(Star):
                 # 状态：全签 ✓ / 部分签 ◐ / 全未签 ✗
                 "arknights": self._merge_state(ak_states),
                 "endfield": self._merge_state(ef_states),
+                # 奖励按游戏归属，卡片里分开两行显示
+                "ak_awards": ak_awards,
+                "ef_awards": ef_awards,
                 "failed": failed,
             })
 
