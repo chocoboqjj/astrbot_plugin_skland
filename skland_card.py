@@ -142,6 +142,19 @@ THEME_LIGHT = {
 GAME_LABELS = (("明日方舟", "arknights"), ("终末地", "endfield"))
 
 
+def _state_value(state) -> str:
+    """
+    归一化签到状态。
+
+    兼容 bool（旧格式）与 str（新格式 "all"/"part"/"none"）。
+    """
+    if isinstance(state, bool):
+        return "all" if state else "none"
+    if isinstance(state, str):
+        return state if state in ("all", "part", "none") else "none"
+    return "none"
+
+
 def _pick_bold_index(font_path: str) -> int:
     """在 ttc 字体集中挑一个加粗字重，返回 index"""
     try:
@@ -247,13 +260,32 @@ class CardRenderer:
                 (x + size * 0.18, y + size * 0.82)],
                fill=color, width=max(2, size // 8))
 
+    def _mark(self, d, x, y, ok: bool, part: bool, c) -> None:
+        """
+        绘制状态标记。
+
+        ok 为 True  → 绿色对勾（全部已签）
+        part 为 True → 橙色半填充方块（部分已签，多账号场景）
+        否则         → 红色叉号（未签）
+        """
+        if ok:
+            self._check(d, x, y + 5, 20, c["ok"])
+        elif part:
+            # 半填充方块：左半橙色、右半背景色，一眼看出「部分」
+            half = 10
+            d.rectangle([x, y + 5, x + half, y + 25], fill=c["accent"])
+            d.rectangle([x + half, y + 5, x + 20, y + 25], fill=c["muted"])
+        else:
+            self._cross(d, x, y + 5, 20, c["bad"])
+
     def render(self, rows: list, title: str = "森空岛签到",
                subtitle: str = "Skland Daily Check-in") -> Optional[str]:
         """
         渲染签到卡片。
 
         rows: [{"name": str, "ak_name": str, "ef_name": str,
-                "arknights": bool, "endfield": bool}]
+                "arknights": bool|str, "endfield": bool|str}]
+        状态可为 bool（True/False）或 "all"/"part"/"none"（多账号合并状态）。
         返回临时图片路径；不可用或失败时返回 None，由调用方回退纯文本。
         """
         if not self.available:
@@ -287,7 +319,9 @@ class CardRenderer:
             self._text(d, (PAD + 2, 82), subtitle, 16, c["muted"])
 
             # 右上统计：按「人」计数（与底部汇总口径一致）
-            signed = sum(1 for r in rows if r.get("arknights") or r.get("endfield"))
+            signed = sum(1 for r in rows
+                         if _state_value(r.get("arknights")) != "none"
+                         or _state_value(r.get("endfield")) != "none")
             stat = f"{signed}/{len(rows)}"
             sw = d.textlength(stat, font=self._font(34, True))
             self._text(d, (W - PAD - sw, 34), stat, 34, c["accent"], bold=True)
@@ -301,9 +335,17 @@ class CardRenderer:
             # 一个人一行：两个游戏用斜杠横向合并，勾叉与名字一一对应
             y = 142
             for r in rows:
+                # 角色名列表：同游戏内多个账号用「/」分隔
+                ak_names = r.get("ak_names")
+                ef_names = r.get("ef_names")
+                if ak_names is None and ef_names is None:
+                    ak_names = [r.get("ak_name") or ""] if r.get("ak_name") else []
+                    ef_names = [r.get("ef_name") or ""] if r.get("ef_name") else []
+                ak_names = [n for n in ak_names if n]
+                ef_names = [n for n in ef_names if n]
                 # ak_name 为空表示未绑定方舟，此时不能用 name 兜底
-                ak_name = str(r.get("ak_name") or "")
-                ef_name = str(r.get("ef_name") or "")
+                ak_name = "/".join(ak_names)
+                ef_name = "/".join(ef_names)
                 fallback = str(r.get("name") or "")
                 if not ak_name and not ef_name:
                     # 两个游戏都没绑定昵称时，至少用兜底名占一行
@@ -311,11 +353,15 @@ class CardRenderer:
                 if not ak_name and not ef_name:
                     continue
 
-                ak_ok = bool(r.get("arknights")) and bool(ak_name)
-                ef_ok = bool(r.get("endfield")) and bool(ef_name)
+                ak_state = _state_value(r.get("arknights"))
+                ef_state = _state_value(r.get("endfield"))
+                ak_ok = ak_state == "all" and bool(ak_name)
+                ef_ok = ef_state == "all" and bool(ef_name)
+                ak_part = ak_state == "part" and bool(ak_name)
+                ef_part = ef_state == "part" and bool(ef_name)
 
                 # 状态点
-                if ak_ok or ef_ok:
+                if ak_ok or ef_ok or ak_part or ef_part:
                     d.ellipse([PAD, y + 10, PAD + 12, y + 22], fill=c["ok"])
                 else:
                     d.ellipse([PAD, y + 10, PAD + 12, y + 22], fill=c["dot_off"])
@@ -323,10 +369,10 @@ class CardRenderer:
                 x = PAD + 28
                 # 只渲染实际绑定的游戏
                 if ak_name:
-                    (self._check if ak_ok else self._cross)(d, x, y + 5, 20,
-                                                          c["ok"] if ak_ok else c["bad"])
+                    self._mark(d, x, y, ak_ok, ak_part, c)
                     x += 30
-                    self._text(d, (x, y + 3), "明日方舟", 20, c["text"] if ak_ok else c["muted"])
+                    self._text(d, (x, y + 3), "明日方舟", 20,
+                               c["text"] if (ak_ok or ak_part) else c["muted"])
                     x += 96
 
                 if ef_name:
@@ -334,19 +380,19 @@ class CardRenderer:
                         # 斜杠
                         self._text(d, (x - 8, y + 3), "/", 20, c["muted"])
                         x += 18
-                    (self._check if ef_ok else self._cross)(d, x, y + 5, 20,
-                                                          c["ok"] if ef_ok else c["bad"])
+                    self._mark(d, x, y, ef_ok, ef_part, c)
                     x += 30
-                    self._text(d, (x, y + 3), "终末地", 20, c["text"] if ef_ok else c["muted"])
+                    self._text(d, (x, y + 3), "终末地", 20,
+                               c["text"] if (ef_ok or ef_part) else c["muted"])
                     x += 96
                 else:
                     x += 4
 
-                # 角色名（两个游戏用斜杠连接）
+                # 角色名：两个游戏之间用「｜」分隔，与账号间的「/」区分
                 label = ak_name[:20] if len(ak_name) > 20 else ak_name
                 if ef_name:
                     ef_short = ef_name[:20] if len(ef_name) > 20 else ef_name
-                    label = f"{label} / {ef_short}" if label else ef_short
+                    label = f"{label} ｜ {ef_short}" if label else ef_short
                 self._text(d, (x, y), label, 23, c["text"], bold=True)
 
                 # 奖励按游戏归属，各自显示在对应游戏名下方
@@ -356,9 +402,11 @@ class CardRenderer:
             d.rectangle([PAD, H - 64, W - PAD, H - 63], fill=c["div"])
             # 统计按实际绑定的游戏计数，未绑定某游戏的不计入
             ak_c = sum(1 for r in rows
-                       if r.get("arknights") and (r.get("ak_name") or r.get("name")))
+                       if _state_value(r.get("arknights")) != "none"
+                       and (r.get("ak_names") or r.get("ak_name") or r.get("name")))
             ef_c = sum(1 for r in rows
-                       if r.get("endfield") and (r.get("ef_name") or r.get("ak_name")))
+                       if _state_value(r.get("endfield")) != "none"
+                       and (r.get("ef_names") or r.get("ef_name") or r.get("ak_name")))
             self._text(d, (PAD, H - 48), f"明日方舟 {ak_c} 人", 19, c["muted"])
             self._text(d, (PAD + 160, H - 48), f"终末地 {ef_c} 人", 19, c["muted"])
             footer = "Created By 梅莉"

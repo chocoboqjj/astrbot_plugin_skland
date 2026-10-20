@@ -6,7 +6,9 @@ Commands:
 - skd (private): Show user's own sign-in status
 - skdlogin (all): Login with token and immediately sign in
     群聊使用时会自动撤回含 token 的那条消息
+    多次登录可绑定多个森空岛账号
 - skdlogout (all): Logout and remove token
+    带 token 参数时只移除指定的森空岛账号
 - skdusers (all): Show users and stats
 - skdhelp (all): Show help
 - skdcheck (all): Diagnose sign-in card image availability
@@ -211,6 +213,117 @@ class SklandPlugin(Star):
             current = alias
         return current if current in users else user_id
 
+    # ==================== Accounts (多账号支持) ====================
+
+    @staticmethod
+    def _get_accounts(user_data: dict) -> list[dict]:
+        """
+        取该用户绑定的所有森空岛账号。
+
+        一个平台用户可以绑定多个森空岛账号（多个 token），每个账号
+        有各自的昵称、签到状态与结果。旧数据只有单个 token，
+        这里把它视为「唯一账号」返回，保证向后兼容。
+        """
+        accounts = user_data.get("accounts")
+        if isinstance(accounts, list) and accounts:
+            return accounts
+        # 旧结构：token 直接挂在 user_data 上
+        if user_data.get("token"):
+            legacy = {
+                "token": user_data["token"],
+                "nickname": user_data.get("nickname", ""),
+                "game_names": user_data.get("game_names") or {},
+                "last_sign": user_data.get("last_sign") or {},
+                "game_awards": user_data.get("game_awards") or {},
+                "last_result": user_data.get("last_result") or {},
+            }
+            return [legacy]
+        # 没有 token 但保留了历史签到结果：仍要能展示
+        if user_data.get("last_result") or user_data.get("last_sign"):
+            return [{
+                "token": "",
+                "nickname": user_data.get("nickname", ""),
+                "game_names": user_data.get("game_names") or {},
+                "last_sign": user_data.get("last_sign") or {},
+                "game_awards": user_data.get("game_awards") or {},
+                "last_result": user_data.get("last_result") or {},
+            }]
+        return []
+
+    @staticmethod
+    def _find_account_by_token(user_data: dict, token: str) -> dict | None:
+        """按 token 找出已存在的账号"""
+        for acc in SklandPlugin._get_accounts(user_data):
+            if acc.get("token") == token:
+                return acc
+        return None
+
+    @staticmethod
+    def _upsert_account(user_data: dict, account: dict) -> list[dict]:
+        """
+        写入（或更新）一个森空岛账号，返回该用户的全部账号。
+
+        同一个 token 视为同一个账号（更新）；不同 token 追加为新账号。
+        """
+        accounts = user_data.get("accounts")
+        if not isinstance(accounts, list):
+            accounts = []
+            # 迁移旧结构：把顶层 token 转成 accounts[0]
+            legacy_token = user_data.get("token")
+            if legacy_token:
+                accounts.append({
+                    "token": legacy_token,
+                    "nickname": user_data.get("nickname", ""),
+                    "game_names": user_data.get("game_names") or {},
+                    "last_sign": user_data.get("last_sign") or {},
+                    "game_awards": user_data.get("game_awards") or {},
+                    "last_result": user_data.get("last_result") or {},
+                })
+
+        token = account.get("token")
+        for acc in accounts:
+            if acc.get("token") == token:
+                acc.update(account)
+                break
+        else:
+            accounts.append(account)
+
+        user_data["accounts"] = accounts
+        # 顶层字段镜像第一个账号，兼容旧读取路径
+        if accounts:
+            first = accounts[0]
+            user_data["token"] = first.get("token", "")
+            user_data["nickname"] = first.get("nickname", "")
+            user_data["game_names"] = first.get("game_names") or {}
+            user_data["last_sign"] = first.get("last_sign") or {}
+            user_data["game_awards"] = first.get("game_awards") or {}
+            user_data["last_result"] = first.get("last_result") or {}
+        return accounts
+
+    @staticmethod
+    def _remove_account(user_data: dict, token: str) -> bool:
+        """按 token 移除一个账号，返回是否移除成功"""
+        accounts = user_data.get("accounts")
+        if not isinstance(accounts, list):
+            accounts = SklandPlugin._get_accounts(user_data)
+        remaining = [a for a in accounts if a.get("token") != token]
+        if len(remaining) == len(accounts):
+            return False
+        user_data["accounts"] = remaining
+        if remaining:
+            first = remaining[0]
+            user_data["token"] = first.get("token", "")
+            user_data["nickname"] = first.get("nickname", "")
+            user_data["game_names"] = first.get("game_names") or {}
+            user_data["last_sign"] = first.get("last_sign") or {}
+            user_data["game_awards"] = first.get("game_awards") or {}
+            user_data["last_result"] = first.get("last_result") or {}
+        else:
+            for key in ("token", "nickname", "game_names", "last_sign",
+                        "game_awards", "last_result"):
+                user_data.pop(key, None)
+        return True
+
     async def _migrate_storage(self) -> None:
         """把旧版 groups 结构（group_id -> [user_id]）迁移为带平台前缀的新版"""
         groups = await self.get_kv_data("groups", {})
@@ -359,40 +472,64 @@ class SklandPlugin(Star):
                 logger.info(f"处理下一个用户前等待 {delay:.2f} 秒")
                 await asyncio.sleep(delay)
 
-            if "token" not in user_data:
+            accounts = self._get_accounts(user_data)
+            if not accounts:
                 continue
 
-            try:
-                results, nickname = await self.api.do_full_sign_in(user_data["token"])
-                self._mark_signed(user_data, results, today)
-                self._store_game_names(user_data, results)
-                self._store_game_awards(user_data, results)
+            all_bodies = []
+            any_ok = False
+            failed_accounts = []
 
-                body = self._format_sign_status(results, nickname)
-                ok = any(self._is_signed_today(r) for r in results) if results else False
+            for account in accounts:
+                token = account.get("token")
+                if not token:
+                    continue
+                try:
+                    results, nickname = await self.api.do_full_sign_in(token)
+                    self._mark_signed(account, results, today)
+                    self._store_game_names(account, results)
+                    self._store_game_awards(account, results)
 
-                # 结果始终落库，供拉取模型读取
-                user_data["last_result"] = {"time": stamp, "text": body, "ok": ok}
-                if nickname:
-                    user_data["nickname"] = nickname
+                    body = self._format_sign_status(results, nickname)
+                    ok = any(self._is_signed_today(r) for r in results) if results else False
+                    any_ok = any_ok or ok
 
-                message = f"🎮森空岛自动签到结果\n\n{body}"
+                    # 结果始终落库，供拉取模型读取
+                    account["last_result"] = {"time": stamp, "text": body, "ok": ok}
+                    if nickname:
+                        account["nickname"] = nickname
+
+                    all_bodies.append(body)
+                    logger.info(f"用户 {user_id} ({nickname}) 自动签到完成")
+                except Exception as e:
+                    logger.error(f"用户 {user_id} 账号 {nickname or '?'} 签到失败: {e}")
+                    account["last_result"] = {
+                        "time": stamp, "text": f"签到失败：{e}", "ok": False}
+                    failed_accounts.append(f"{account.get('nickname') or '账号'}: {e}")
+
+            if not all_bodies and not failed_accounts:
+                continue
+
+            # 顶层镜像第一个账号（兼容旧读取路径）
+            self._upsert_account(user_data, accounts[0])
+
+            if all_bodies:
+                message = "🎮森空岛自动签到结果\n\n" + "\n\n".join(all_bodies)
                 await self._push_to_user(user_id, user_data, message)
 
-                display = self._display_name(user_data.get("nickname", ""), user_data)
+            if failed_accounts:
+                await self._push_to_user(
+                    user_id, user_data,
+                    "⚠️ 自动签到失败\n错误: " + "\n".join(failed_accounts)
+                    + "\n请使用 /skdlogin 重新登录",
+                )
+
+            display = self._display_name(user_data.get("nickname", ""), user_data)
+            if any_ok:
                 for gkey in self._find_user_groups(await self.get_kv_data("groups", {}), user_id):
                     broadcast_groups.setdefault(gkey, []).append(display)
 
-                users[user_id] = user_data
-                logger.info(f"用户 {user_id} ({nickname}) 自动签到完成")
-            except Exception as e:
-                logger.error(f"用户 {user_id} 自动签到失败: {e}")
-                user_data["last_result"] = {"time": stamp, "text": f"签到失败：{e}", "ok": False}
-                users[user_id] = user_data
-                await self._push_to_user(
-                    user_id, user_data,
-                    f"⚠️ 自动签到失败\n错误: {e}\n请使用 /skdlogin 重新登录",
-                )
+            users[user_id] = user_data
 
         await self.put_kv_data("users", users)
 
@@ -524,67 +661,87 @@ class SklandPlugin(Star):
         return nickname.strip() if nickname and nickname.strip() else fallback
 
     def _private_card_rows(self, user_data: dict) -> list:
-        """把私聊的落库结果转成卡片行数据"""
-        last_sign = user_data.get("last_sign") or {}
-        names = user_data.get("game_names") or {}
+        """把私聊的落库结果转成卡片行数据（合并该用户的所有账号）"""
+        accounts = self._get_accounts(user_data)
         fallback = self._display_name(user_data.get("nickname", ""), user_data)
 
-        ak_signed = bool(last_sign.get("arknights"))
-        ef_signed = bool(last_sign.get("endfield"))
-        ak_name = names.get("arknights") or (fallback if ak_signed else "")
-        ef_name = names.get("endfield") or (fallback if ef_signed else "")
+        ak_names, ak_states = [], []
+        ef_names, ef_states = [], []
+        for account in accounts:
+            last_sign = account.get("last_sign") or {}
+            names = account.get("game_names") or {}
+            nick = self._display_name(account.get("nickname", ""), user_data)
+
+            ak_signed = bool(last_sign.get("arknights"))
+            ef_signed = bool(last_sign.get("endfield"))
+            ak_name = names.get("arknights") or (nick if ak_signed else "")
+            ef_name = names.get("endfield") or (nick if ef_signed else "")
+            if ak_name:
+                ak_names.append(ak_name)
+                ak_states.append(ak_signed)
+            if ef_name:
+                ef_names.append(ef_name)
+                ef_states.append(ef_signed)
 
         return [{
-            "name": ak_name or ef_name or fallback,
-            "ak_name": ak_name,
-            "ef_name": ef_name,
-            "arknights": ak_signed,
-            "endfield": ef_signed,
+            "name": fallback,
+            "ak_name": "/".join(ak_names),
+            "ef_name": "/".join(ef_names),
+            "arknights": self._merge_state(ak_states),
+            "endfield": self._merge_state(ef_states),
         }]
 
     def _render_stored_result(self, user_data: dict) -> str:
-        """把落库的签到结果渲染成查询回复（拉取模型）"""
-        last = user_data.get("last_result") or {}
-        text = last.get("text")
-        names = user_data.get("game_names") or {}
+        """把落库的签到结果渲染成查询回复（拉取模型），展示该用户所有账号"""
+        accounts = self._get_accounts(user_data)
         fallback = self._display_name(user_data.get("nickname", ""), user_data)
-        if not text:
+        if not accounts:
             return "📋 森空岛签到\n\n暂无签到记录，发送 /skdlogin <token> 开始绑定"
 
-        stamp = last.get("time") or ""
-        try:
-            stamp = datetime.fromisoformat(stamp).strftime("%Y-%m-%d %H:%M")
-        except (TypeError, ValueError):
-            stamp = ""
-
-        # 落库文本形如「明日方舟 已签到 (奖励)」，这里按游戏拆出各自昵称与状态
-        entries = []
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line or (line.startswith("【") and line.endswith("】")):
-                continue
-            game = "明日方舟" if line.startswith("明日方舟") else (
-                "终末地" if line.startswith("终末地") else None
-            )
-            if game is None:
-                continue
-            key = "arknights" if game == "明日方舟" else "endfield"
-            # 详情去掉开头重复的游戏名，只留状态
-            detail = line[len(game):].strip()
-            # 去掉奖励括号，只保留「已签到」状态
-            if "已签到 (" in detail and detail.endswith(")"):
-                detail = detail[:detail.index("(")].strip()
-            name = names.get(key) or fallback
-            entries.append((game, key, name, detail))
-
         lines = ["📋 森空岛签到", ""]
-        for game, key, name, detail in entries:
-            lines.append(f"  {game}　{name}")
-            if detail:
-                lines.append(f"    {detail}")
-        if stamp:
+        for idx, account in enumerate(accounts, 1):
+            last = account.get("last_result") or {}
+            text = last.get("text") or ""
+            names = account.get("game_names") or {}
+            nick = self._display_name(account.get("nickname", ""), user_data)
+
+            stamp = last.get("time") or ""
+            try:
+                stamp = datetime.fromisoformat(stamp).strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                stamp = ""
+
+            # 多个账号时加标题区分
+            if len(accounts) > 1:
+                lines.append(f"【账号 {idx}】{nick}")
+            else:
+                lines.append(nick)
+
+            if not text:
+                lines.append("    暂无签到记录")
+                continue
+
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line or (line.startswith("【") and line.endswith("】")):
+                    continue
+                game = "明日方舟" if line.startswith("明日方舟") else (
+                    "终末地" if line.startswith("终末地") else None
+                )
+                if game is None:
+                    continue
+                key = "arknights" if game == "明日方舟" else "endfield"
+                # 详情去掉开头重复的游戏名，只留状态
+                detail = line[len(game):].strip()
+                # 去掉奖励括号，只保留「已签到」状态
+                if "已签到 (" in detail and detail.endswith(")"):
+                    detail = detail[:detail.index("(")].strip()
+                lines.append(f"    {game}　{names.get(key) or nick}")
+                if detail:
+                    lines.append(f"      {detail}")
+            if stamp:
+                lines.append(f"    {stamp}")
             lines.append("")
-            lines.append(f"  {stamp}")
         return "\n".join(lines)
 
     # ==================== Commands ====================
@@ -682,7 +839,7 @@ class SklandPlugin(Star):
             async for res in self.skdcheck(event):
                 yield res
         elif target == "skdlogout":
-            async for res in self.skdlogout(event):
+            async for res in self.skdlogout(event, arg):
                 yield res
         elif target == "skdlogin":
             async for res in self.skdlogin(event, arg):
@@ -698,7 +855,10 @@ class SklandPlugin(Star):
             "3. /skd 查看签到状态\n"
             "4. /skdusers 查看绑定统计\n"
             "5. /skdcheck 查看签到卡片图片的可用状态\n"
-            "注：token 等同账号密码，群聊中发送后插件会自动撤回该条消息"
+            "注：token 等同账号密码，群聊中发送后插件会自动撤回该条消息\n"
+            "多账号：多次 /skdlogin 可绑定多个森空岛账号，\n"
+            "     列表中同一游戏的角色名用 / 分隔；\n"
+            "     /skdlogout <token> 可单独移除某个账号"
         )
 
     @filter.command("skdcheck")
@@ -797,8 +957,6 @@ class SklandPlugin(Star):
 
             # 复用既有记录，避免覆盖丢失 token / last_sign 等字段
             user_data = users.get(user_id) or {}
-            user_data["token"] = token
-            user_data["nickname"] = nickname
             user_data["last_username"] = user_name
             user_data["bound_at"] = user_data.get("bound_at") or now.isoformat()
             user_data["platform_name"] = platform
@@ -808,16 +966,28 @@ class SklandPlugin(Star):
             user_data["umo_by_platform"] = umo_map
             user_data["umo"] = event.unified_msg_origin
 
-            self._mark_signed(user_data, results, now.strftime("%Y-%m-%d"))
-            self._store_game_names(user_data, results)
-            self._store_game_awards(user_data, results)
+            # 每个 token 是一个独立账号：同 token 视为更新，新 token 追加
+            is_new_account = self._find_account_by_token(user_data, token) is None
+            account = {
+                "token": token,
+                "nickname": nickname,
+                "last_sign": {},
+                "game_names": {},
+                "game_awards": {},
+                "last_result": {},
+            }
+            self._mark_signed(account, results, now.strftime("%Y-%m-%d"))
+            self._store_game_names(account, results)
+            self._store_game_awards(account, results)
 
             body = self._format_sign_status(results, nickname)
-            user_data["last_result"] = {
+            account["last_result"] = {
                 "time": now.isoformat(timespec="seconds"),
                 "text": body,
                 "ok": any(self._is_signed_today(r) for r in results) if results else False,
             }
+            accounts = self._upsert_account(user_data, account)
+            account_count = len(accounts)
 
             users[user_id] = user_data
             await self.put_kv_data("users", users)
@@ -844,13 +1014,20 @@ class SklandPlugin(Star):
 
             notice = "" if self._can_push(platform) else \
                 "\n\n（当前平台不支持主动推送，将在你查询时展示结果）"
-            yield event.plain_result(f"登录成功！\n{body}{notice}{recall_note}")
+            if account_count > 1:
+                head = f"登录成功！（已绑定 {account_count} 个森空岛账号）"
+            elif is_new_account:
+                head = "登录成功！"
+            else:
+                head = "登录成功！（已更新该账号的签到状态）"
+            yield event.plain_result(f"{head}\n{body}{notice}{recall_note}")
         except Exception as e:
             logger.error(f"skdlogin失败: {e}")
             # 失败时也要撤回，防止 token 留在群里
             if is_group:
                 await self._recall_message(event)
             yield event.plain_result(f"登录失败: {e}")
+
     # 官方错误码 → 用户可读提示
     _RECALL_ERROR_HINTS = {
         "40062003": "机器人不是群管理员，无权撤回他人消息",
@@ -913,8 +1090,13 @@ class SklandPlugin(Star):
             return False, reason
 
     @filter.command("skdlogout")
-    async def skdlogout(self, event: AstrMessageEvent):
-        """登出并清除绑定信息"""
+    async def skdlogout(self, event: AstrMessageEvent, token: str = ""):
+        """
+        登出并清除绑定信息。
+
+        不带参数：解除当前平台的绑定（保留账号），其他平台仍可推送。
+        带 token：移除指定的森空岛账号；该平台没有其他账号时一并解除绑定。
+        """
         users = await self.get_kv_data("users", {})
         user_id = self._resolve_user_key(users, event.get_sender_id())
         if user_id not in users:
@@ -923,6 +1105,31 @@ class SklandPlugin(Star):
 
         platform = self._detect_platform(event)
         user_data = users[user_id]
+        accounts = self._get_accounts(user_data)
+        token = (token or "").strip()
+
+        # 指定 token：只移除该账号
+        if token:
+            if not any(a.get("token") == token for a in accounts):
+                yield event.plain_result("未找到该 token 对应的账号")
+                return
+            self._remove_account(user_data, token)
+            left = self._get_accounts(user_data)
+            groups = await self.get_kv_data("groups", {})
+            if not left:
+                # 没有账号了，彻底解绑
+                self._unbind_user(users, groups, user_id)
+            else:
+                users[user_id] = user_data
+            await self.put_kv_data("groups", groups)
+            await self.put_kv_data("users", users)
+            yield event.plain_result(
+                f"已移除该森空岛账号，剩余 {len(left)} 个账号"
+                if left else "已移除该森空岛账号并解除绑定"
+            )
+            return
+
+        # 不带 token：解除当前平台绑定
         remaining = {k: v for k, v in (user_data.get("umo_by_platform") or {}).items()
                      if k != platform and v}
 
@@ -934,14 +1141,44 @@ class SklandPlugin(Star):
             await self.put_kv_data("users", users)
             yield event.plain_result("已解除当前平台的绑定，其他平台绑定仍然有效")
         else:
-            del users[user_id]
             groups = await self.get_kv_data("groups", {})
-            for meta in groups.values():
-                if isinstance(meta, dict) and user_id in (meta.get("members") or []):
-                    meta["members"].remove(user_id)
+            self._unbind_user(users, groups, user_id)
             await self.put_kv_data("groups", groups)
             await self.put_kv_data("users", users)
             yield event.plain_result("已退出登录并清除绑定信息")
+
+    @staticmethod
+    def _unbind_user(users: dict, groups: dict, user_id: str) -> None:
+        """彻底解除一个用户的绑定：从 users 移除，并从所有群成员列表中移除"""
+        users.pop(user_id, None)
+        for meta in groups.values():
+            if isinstance(meta, dict) and user_id in (meta.get("members") or []):
+                meta["members"].remove(user_id)
+
+    @staticmethod
+    def _merge_state(states: list[bool]) -> str:
+        """
+        合并多个账号在某个游戏上的签到状态。
+
+        返回 "all"（全部已签）/ "part"（部分已签）/ "none"（都没签）。
+        """
+        if not states:
+            return "none"
+        signed = sum(1 for s in states if s)
+        if signed == 0:
+            return "none"
+        if signed == len(states):
+            return "all"
+        return "part"
+
+    @staticmethod
+    def _normalize_state(state) -> str:
+        """归一化状态：兼容 bool（旧格式）与 str（新格式）"""
+        if isinstance(state, bool):
+            return "all" if state else "none"
+        if isinstance(state, str) and state in ("all", "part", "none"):
+            return state
+        return "none"
 
     @filter.command("skdusers")
     async def skdusers(self, event: AstrMessageEvent):
@@ -1054,38 +1291,62 @@ class SklandPlugin(Star):
         # 森空岛签到状态与群无关，统一按已绑定用户展示更符合预期。
         rows = []
         for uid, user_data in users_data.items():
-            if not user_data or not user_data.get("token"):
+            accounts = self._get_accounts(user_data)
+            if not accounts:
                 continue
-            nickname = user_data.get("nickname", "")
+
             failed = False
             if live:
-                try:
-                    results, live_nick = await self.api.do_full_sign_in(user_data["token"])
-                    nickname = live_nick or nickname
-                    self._mark_signed(user_data, results, today)
-                    self._store_game_names(user_data, results)
-                    self._store_game_awards(user_data, results)
-                    if nickname:
-                        user_data["nickname"] = nickname
-                    users_data[uid] = user_data
-                except Exception as e:
-                    logger.warning(f"群聊实时查询用户 {uid} 失败: {e}")
-                    failed = True
+                for account in accounts:
+                    token = account.get("token")
+                    if not token:
+                        continue
+                    try:
+                        results, live_nick = await self.api.do_full_sign_in(token)
+                        if live_nick:
+                            account["nickname"] = live_nick
+                        self._mark_signed(account, results, today)
+                        self._store_game_names(account, results)
+                        self._store_game_awards(account, results)
+                    except Exception as e:
+                        logger.warning(f"群聊实时查询用户 {uid} 失败: {e}")
+                        failed = True
+                users_data[uid] = user_data
 
-            last_sign = user_data.get("last_sign") or {}
-            names = user_data.get("game_names") or {}
-            fallback = self._display_name(nickname, user_data)
-            ak_signed = bool(last_sign.get("arknights"))
-            ef_signed = bool(last_sign.get("endfield"))
-            # 只在该游戏确实签到过时才显示，避免未绑定的游戏出现空列
-            ak_name = names.get("arknights") or (fallback if ak_signed else "")
-            ef_name = names.get("endfield") or (fallback if ef_signed else "")
+            # 汇总该用户所有账号在两个游戏上的昵称与签到状态
+            ak_names, ak_states = [], []
+            ef_names, ef_states = [], []
+            for account in accounts:
+                last_sign = account.get("last_sign") or {}
+                names = account.get("game_names") or {}
+                fallback = self._display_name(account.get("nickname", ""), user_data)
+
+                ak_signed = bool(last_sign.get("arknights"))
+                ef_signed = bool(last_sign.get("endfield"))
+                ak_name = names.get("arknights") or (fallback if ak_signed else "")
+                ef_name = names.get("endfield") or (fallback if ef_signed else "")
+                if ak_name:
+                    ak_names.append(ak_name)
+                    ak_states.append(ak_signed)
+                if ef_name:
+                    ef_names.append(ef_name)
+                    ef_states.append(ef_signed)
+
+            if not ak_names and not ef_names:
+                continue
+
             rows.append({
-                "name": fallback,
-                "ak_name": ak_name,
-                "ef_name": ef_name,
-                "arknights": ak_signed,
-                "endfield": ef_signed,
+                "name": self._display_name(
+                    accounts[0].get("nickname", ""), user_data),
+                # 各游戏的角色名列表：同游戏内用「/」分隔多个账号
+                "ak_names": ak_names,
+                "ef_names": ef_names,
+                # 兼容旧的字符串字段
+                "ak_name": "/".join(ak_names),
+                "ef_name": "/".join(ef_names),
+                # 状态：全签 ✓ / 部分签 ◐ / 全未签 ✗
+                "arknights": self._merge_state(ak_states),
+                "endfield": self._merge_state(ef_states),
                 "failed": failed,
             })
 
@@ -1150,31 +1411,42 @@ class SklandPlugin(Star):
                 lines.append(f"  ⚠️ 查询失败　·  {name}")
                 continue
 
-            ak_name = self._truncate(r.get("ak_name") or "", self._NAME_MAX)
-            ef_name = self._truncate(r.get("ef_name") or "", self._NAME_MAX)
+            ak_names = r.get("ak_names")
+            ef_names = r.get("ef_names")
+            if ak_names is None and ef_names is None:
+                # 兼容旧结构：字符串字段
+                ak_names = [r.get("ak_name") or ""] if r.get("ak_name") else []
+                ef_names = [r.get("ef_name") or ""] if r.get("ef_name") else []
+            ak_names = [n for n in ak_names if n]
+            ef_names = [n for n in ef_names if n]
+            ak_name = self._truncate("/".join(ak_names), self._NAME_MAX)
+            ef_name = self._truncate("/".join(ef_names), self._NAME_MAX)
             if not ak_name and not ef_name:
                 # 两个游戏都没有昵称时，至少显示兜底名
                 ak_name = self._truncate(r.get("name", ""), self._NAME_MAX)
 
-            if r["arknights"]:
+            ak_state = self._normalize_state(r.get("arknights", "none"))
+            ef_state = self._normalize_state(r.get("endfield", "none"))
+            if ak_state in ("all", "part"):
                 ak_count += 1
-            if r["endfield"]:
+            if ef_state in ("all", "part"):
                 ef_count += 1
-            if r["arknights"] or r["endfield"]:
+            if ak_state != "none" or ef_state != "none":
                 signed_count += 1
 
             # 只展示实际绑定（有昵称）的游戏，未绑定的不占列
             if ak_name and ef_name:
                 games = "明日方舟/终末地"
-                states = f"{'✓' if r['arknights'] else '✗'}/{'✓' if r['endfield'] else '✗'}"
-                names = f"{ak_name}/{ef_name}"
+                states = f"{self._state_mark(ak_state)}/{self._state_mark(ef_state)}"
+                # 两个游戏的角色名之间用「｜」分隔，避免与账号间的「/」混淆
+                names = f"{ak_name}｜{ef_name}"
             elif ef_name:
                 games = "终末地"
-                states = "✓" if r["endfield"] else "✗"
+                states = self._state_mark(ef_state)
                 names = ef_name
             else:
                 games = "明日方舟"
-                states = "✓" if r["arknights"] else "✗"
+                states = self._state_mark(ak_state)
                 names = ak_name
 
             lines.append(
@@ -1188,3 +1460,9 @@ class SklandPlugin(Star):
         lines.append(f"  已签到 {signed_count}/{total} 人"
                      f"　·　明日方舟 {ak_count}　·　终末地 {ef_count}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _state_mark(state) -> str:
+        """状态标记：全部已签 ✓ / 部分已签 ◐ / 未签 ✗"""
+        return {"all": "✓", "part": "◐", "none": "✗"}.get(
+            SklandPlugin._normalize_state(state), "✗")
