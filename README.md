@@ -1,8 +1,11 @@
 # AstrBot Plugin - 森空岛签到
 
-[![Build and Release](https://github.com/Azincc/astrbot_plugin_skland/actions/workflows/release.yml/badge.svg)](https://github.com/Azincc/astrbot_plugin_skland/actions/workflows/release.yml)
+[![Build and Release](https://github.com/chocoboqjj/astrbot_plugin_skland/actions/workflows/release.yml/badge.svg)](https://github.com/chocoboqjj/astrbot_plugin_skland/actions/workflows/release.yml)
 
 森空岛自动签到插件，支持明日方舟和终末地签到，**同时适配 OneBot(NapCat/LLOneBot) 与 QQ 官方机器人**。
+
+> 本仓库基于 [Azincc/astrbot_plugin_skland](https://github.com/Azincc/astrbot_plugin_skland) 修改，
+> 原作者为 [Azincc](https://github.com/Azincc)，遵循 MIT 许可。主要改动见「从 v1.4.0 升级」。
 
 ## 功能
 
@@ -74,8 +77,37 @@ QQ 官方机器人与 OneBot 的能力差异较大，本插件会**自动识别�
 | `push_mode` | `auto` | `auto` 按平台自动判断 / `private` 强制私聊推送 / `pull` 强制仅落库 |
 | `group_broadcast_enabled` | `false` | 自动签到后向群播报汇总，失败自动静默降级 |
 | `live_query_in_group` | `false` | 群聊 `/skd` 是否实时请求森空岛 |
+| `card_image_enabled` | `false` | `/skd` 以图片卡片输出签到状态 |
+| `card_theme` | `dark` | `dark` 深色 / `light` 浅色卡片 |
 
 > 群聊 `/skd` 默认**读取数据库**中的最近一次签到结果，不产生额外请求。开启 `live_query_in_group` 后会为每个群成员实时请求森空岛接口（每人 4~5 次 HTTP），人数多时较慢且请求量大。
+
+### 签到卡片图片
+
+开启 `card_image_enabled` 后，`/skd` 会输出一张签到状态卡片图片（附纯文本备用信息）。
+
+渲染需要两个条件，**缺一不可**：
+
+1. **Pillow** —— 已在 `requirements.txt` 中列出，AstrBot 会自动安装
+2. **系统中文字体** —— 插件会自动在常见路径查找：
+
+| 系统 | 字体 |
+|------|------|
+| macOS | `/System/Library/Fonts/Hiragino Sans GB.ttc` |
+| Linux | `/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc`、`NotoSansCJK-Regular.ttc` |
+| Windows | `C:/Windows/Fonts/msyh.ttc`、`simhei.ttf` |
+
+> ⚠️ **Docker 部署注意**：精简镜像常常不带中文字体，表现为卡片文字变成方块或直接不渲染。解决方式：
+> ```dockerfile
+> # Debian/Ubuntu
+> RUN apt-get update && apt-get install -y fonts-noto-cjk && rm -rf /var/lib/apt/lists/*
+> ```
+> ```dockerfile
+> # Alpine
+> RUN apk add --no-cache font-noto-cjk
+> ```
+>
+> **字体缺失或 Pillow 未安装时，插件会自动回退为纯文本输出**，不会报错也不会影响签到功能。
 
 ## 从 v1.4.0 升级
 
@@ -83,12 +115,14 @@ QQ 官方机器人与 OneBot 的能力差异较大，本插件会**自动识别�
 - 原有 token 绑定数据保留，新增 `umo_by_platform` 字段用于多平台共存
 - 同一个用户在 OneBot 与 QQ 官方平台各绑定一次后，**任一平台登出不会影响另一平台**
 - 新增裸指令兜底：`skd`、`签到` 等无需 `/` 前缀的写法也能识别
+- 新增 `game_names` 字段，按游戏分别保存昵称。一个森空岛账号可同时绑定明日方舟和终末地，两者的角色名往往不同，现在会各用各的名字显示（旧数据会在下次签到后自动补齐）
+- 新增 `game_awards` 字段，按游戏分别保存奖励，奖励会显示在各自游戏名下（旧数据会自动回退为从文本解析）
 
 ## 安装
 
 ### 方式一：从 Release 下载
 
-1. 前往 [Releases](https://github.com/Azincc/astrbot_plugin_skland/releases) 页面
+1. 前往 [Releases](https://github.com/chocoboqjj/astrbot_plugin_skland/releases) 页面
 2. 下载最新的 `astrbot_plugin_skland-vX.X.X.zip`
 3. 解压到 AstrBot 的 `plugins` 目录
 
@@ -96,7 +130,7 @@ QQ 官方机器人与 OneBot 的能力差异较大，本插件会**自动识别�
 
 ```bash
 cd /path/to/astrbot/plugins
-git clone https://github.com/Azincc/astrbot_plugin_skland.git
+git clone https://github.com/chocoboqjj/astrbot_plugin_skland.git
 ```
 
 ## 依赖

@@ -572,6 +572,8 @@ class SklandAPI:
         Complete sign-in flow for a user token
 
         Returns: (list of results, nickname)
+            nickname 为明日方舟的昵称（兼容旧逻辑），各游戏的独立昵称请读取
+            results 中每个 SignInResult.nickname
         """
         # Get authorization
         auth_code = await self.get_authorization(user_token)
@@ -597,6 +599,22 @@ class SklandAPI:
                 results.extend(endfield_results)
 
         return results, nickname
+
+    @staticmethod
+    def split_nicknames(results: list) -> dict:
+        """
+        从签到结果中按游戏提取昵称。
+
+        Returns: {"arknights": "刀客", "endfield": "终末角色名"}
+            某游戏未绑定或未签到时该键不存在
+        """
+        names = {}
+        for r in results:
+            if r.game == "明日方舟":
+                names.setdefault("arknights", r.nickname)
+            elif r.game == "终末地":
+                names.setdefault("endfield", r.nickname)
+        return {k: v for k, v in names.items() if v}
 
     async def check_sign_in_status(self, user_token: str) -> tuple[dict[str, bool], str]:
         """

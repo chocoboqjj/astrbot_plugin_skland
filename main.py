@@ -34,11 +34,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from astrbot.api import AstrBotConfig, logger
+from astrbot.api import message_components as Comp
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.config import put_config
 
 from .skland_api import SklandAPI
+from .skland_card import CardRenderer
 
 PLUGIN_NAME = "astrbot_plugin_skland"
 
@@ -78,6 +80,7 @@ class SklandPlugin(Star):
         self.config = config
         self.api = SklandAPI(max_retries=3)
         self.scheduler = AsyncIOScheduler()
+        self._card = CardRenderer(theme=self.config.get("card_theme", "dark"))
         self._init_config()
 
     # ==================== Config ====================
@@ -101,6 +104,10 @@ class SklandPlugin(Star):
              "自动签到完成后向已有群播报一次汇总（需群主开启主动发言）"),
             ("群聊实时查询", "live_query_in_group", False,
              "开启后群聊 /skd 实时请求森空岛，人数多时较慢且请求量大"),
+            ("签到卡片图片", "card_image_enabled", False,
+             "开启后 /skd 以图片卡片输出签到状态；缺少 Pillow 或中文字体时自动回退为文本"),
+            ("卡片主题", "card_theme", "dark",
+             "dark=深色 / light=浅色，仅在启用图片卡片时生效"),
         ]
         for name, key, value, description in defaults:
             put_config(
@@ -122,6 +129,8 @@ class SklandPlugin(Star):
             "push_mode": self.config.get("push_mode", "auto"),
             "group_broadcast_enabled": self.config.get("group_broadcast_enabled", False),
             "live_query_in_group": self.config.get("live_query_in_group", False),
+            "card_image_enabled": self.config.get("card_image_enabled", False),
+            "card_theme": self.config.get("card_theme", "dark"),
         }
 
     # ==================== Platform Capability ====================
@@ -274,6 +283,48 @@ class SklandPlugin(Star):
         user_data["last_sign"] = last_sign
 
     @staticmethod
+    def _store_game_names(user_data: dict, results: list) -> dict:
+        """
+        按游戏分别记录昵称。
+
+        森空岛的一个账号可以同时绑定明日方舟和终末地，两者的角色名
+        往往不同。旧逻辑只保存 bindings[0].nickname（恒为方舟昵称），
+        这里改为按游戏分别存储，供展示时各用各的名字。
+        """
+        names = user_data.get("game_names") or {}
+        for r in results:
+            if not r.nickname:
+                continue
+            if r.game == "明日方舟":
+                names.setdefault("arknights", r.nickname)
+            elif r.game == "终末地":
+                # 终末地可能绑定多个角色，展示首个即可，不被后续覆盖
+                names.setdefault("endfield", r.nickname)
+        user_data["game_names"] = names
+        return names
+
+    @staticmethod
+    def _store_game_awards(user_data: dict, results: list) -> dict:
+        """
+        按游戏分别记录奖励。
+
+        与 game_names 同理，奖励也归属到具体游戏，
+        避免方舟的奖励被显示在终末地那行。
+        """
+        awards_map = user_data.get("game_awards") or {}
+        for r in results:
+            key = "arknights" if r.game == "明日方舟" else (
+                "endfield" if r.game == "终末地" else None
+            )
+            if key is None:
+                continue
+            items = [str(a) for a in (getattr(r, "awards", None) or []) if a]
+            if items:
+                awards_map.setdefault(key, items)
+        user_data["game_awards"] = awards_map
+        return awards_map
+
+    @staticmethod
     def _is_signed_today_static(result) -> bool:
         if result.success:
             return True
@@ -312,6 +363,8 @@ class SklandPlugin(Star):
             try:
                 results, nickname = await self.api.do_full_sign_in(user_data["token"])
                 self._mark_signed(user_data, results, today)
+                self._store_game_names(user_data, results)
+                self._store_game_awards(user_data, results)
 
                 body = self._format_sign_status(results, nickname)
                 ok = any(self._is_signed_today(r) for r in results) if results else False
@@ -445,11 +498,53 @@ class SklandPlugin(Star):
             return fallback
         return nickname.strip() if nickname and nickname.strip() else fallback
 
+    def _private_card_rows(self, user_data: dict) -> list:
+        """把私聊的落库结果转成卡片行数据"""
+        last_sign = user_data.get("last_sign") or {}
+        names = user_data.get("game_names") or {}
+        awards_map = user_data.get("game_awards") or {}
+        fallback = self._display_name(user_data.get("nickname", ""), user_data)
+
+        ak_signed = bool(last_sign.get("arknights"))
+        ef_signed = bool(last_sign.get("endfield"))
+        ak_name = names.get("arknights") or (fallback if ak_signed else "")
+        ef_name = names.get("endfield") or (fallback if ef_signed else "")
+
+        # 奖励按游戏归属，优先用结构化的 game_awards，
+        # 旧数据没有该字段时回退解析落库文本
+        awards_map = dict(awards_map)
+        if "arknights" not in awards_map or "endfield" not in awards_map:
+            text = (user_data.get("last_result") or {}).get("text") or ""
+            for line in text.split("\n"):
+                line = line.strip()
+                if "已签到 (" not in line or not line.endswith(")"):
+                    continue
+                inner = line[line.index("(") + 1:-1]
+                if not inner or inner == "无奖励":
+                    continue
+                items = [a.strip() for a in inner.split(",")]
+                if line.startswith("明日方舟"):
+                    awards_map.setdefault("arknights", items)
+                elif line.startswith("终末地"):
+                    awards_map.setdefault("endfield", items)
+
+        return [{
+            "name": ak_name or ef_name or fallback,
+            "ak_name": ak_name,
+            "ef_name": ef_name,
+            "arknights": ak_signed,
+            "endfield": ef_signed,
+            "ak_awards": awards_map.get("arknights") or [],
+            "ef_awards": awards_map.get("endfield") or [],
+            "awards": awards_map.get("arknights") or [],
+        }]
+
     def _render_stored_result(self, user_data: dict) -> str:
         """把落库的签到结果渲染成查询回复（拉取模型）"""
         last = user_data.get("last_result") or {}
         text = last.get("text")
-        name = self._display_name(user_data.get("nickname", ""), user_data)
+        names = user_data.get("game_names") or {}
+        fallback = self._display_name(user_data.get("nickname", ""), user_data)
         if not text:
             return "📋 森空岛签到\n\n暂无签到记录，发送 /skdlogin <token> 开始绑定"
 
@@ -459,15 +554,35 @@ class SklandPlugin(Star):
         except (TypeError, ValueError):
             stamp = ""
 
-        lines = ["📋 森空岛签到", "", f"  {name}"]
+        # 落库文本形如「明日方舟 已签到 (奖励)」，这里按游戏拆出各自昵称与奖励
+        awards_map = user_data.get("game_awards") or {}
+        entries = []
         for line in text.split("\n"):
             line = line.strip()
-            if not line:
+            if not line or (line.startswith("【") and line.endswith("】")):
                 continue
-            # 落库文本首行形如「【昵称】」，这里已单独展示昵称，跳过
-            if line.startswith("【") and line.endswith("】"):
+            game = "明日方舟" if line.startswith("明日方舟") else (
+                "终末地" if line.startswith("终末地") else None
+            )
+            if game is None:
                 continue
-            lines.append(f"    {line}")
+            key = "arknights" if game == "明日方舟" else "endfield"
+            # 详情去掉开头重复的游戏名，只留状态与奖励
+            detail = line[len(game):].strip()
+            name = names.get(key) or fallback
+            # 奖励优先用结构化数据，旧数据回退从详情里解析
+            items = awards_map.get(key)
+            if items is None and "已签到 (" in detail and detail.endswith(")"):
+                inner = detail[detail.index("(") + 1:-1]
+                if inner and inner != "无奖励":
+                    items = [a.strip() for a in inner.split(",")]
+            entries.append((game, key, name, items or []))
+
+        lines = ["📋 森空岛签到", ""]
+        for game, key, name, items in entries:
+            lines.append(f"  {game}　{name}")
+            if items:
+                lines.append(f"    {'  '.join(items)}")
         if stamp:
             lines.append("")
             lines.append(f"  {stamp}")
@@ -611,6 +726,8 @@ class SklandPlugin(Star):
             user_data["umo"] = event.unified_msg_origin
 
             self._mark_signed(user_data, results, now.strftime("%Y-%m-%d"))
+            self._store_game_names(user_data, results)
+            self._store_game_awards(user_data, results)
 
             body = self._format_sign_status(results, nickname)
             user_data["last_result"] = {
@@ -731,7 +848,18 @@ class SklandPlugin(Star):
             if not user_data:
                 yield event.plain_result("你还未绑定账号，请使用 /skdlogin <token>")
                 return
-            yield event.plain_result(self._render_stored_result(user_data))
+
+            text = self._render_stored_result(user_data)
+            if config.get("card_image_enabled", False):
+                path = self._render_card(self._private_card_rows(user_data))
+                if path:
+                    yield event.chain_result([
+                        Comp.Image.fromFileSystem(path),
+                        Comp.Plain(text),
+                    ])
+                    return
+                logger.info("卡片渲染不可用，回退为纯文本输出")
+            yield event.plain_result(text)
             return
 
         # ==================== 群聊 ====================
@@ -767,6 +895,8 @@ class SklandPlugin(Star):
                     results, live_nick = await self.api.do_full_sign_in(user_data["token"])
                     nickname = live_nick or nickname
                     self._mark_signed(user_data, results, today)
+                    self._store_game_names(user_data, results)
+                    self._store_game_awards(user_data, results)
                     if nickname:
                         user_data["nickname"] = nickname
                     users_data[uid] = user_data
@@ -775,28 +905,63 @@ class SklandPlugin(Star):
                     failed = True
 
             last_sign = user_data.get("last_sign") or {}
+            names = user_data.get("game_names") or {}
+            awards_map = user_data.get("game_awards") or {}
+            fallback = self._display_name(nickname, user_data)
+            ak_signed = bool(last_sign.get("arknights"))
+            ef_signed = bool(last_sign.get("endfield"))
+            # 只在该游戏确实签到过时才显示，避免未绑定的游戏出现空列
+            ak_name = names.get("arknights") or (fallback if ak_signed else "")
+            ef_name = names.get("endfield") or (fallback if ef_signed else "")
             rows.append({
-                "name": self._display_name(nickname, user_data),
-                "arknights": bool(last_sign.get("arknights")),
-                "endfield": bool(last_sign.get("endfield")),
+                "name": fallback,
+                "ak_name": ak_name,
+                "ef_name": ef_name,
+                "arknights": ak_signed,
+                "endfield": ef_signed,
+                "ak_awards": awards_map.get("arknights") or [],
+                "ef_awards": awards_map.get("endfield") or [],
                 "failed": failed,
             })
 
         await self.put_kv_data("groups", groups)
         await self.put_kv_data("users", users_data)
 
+        # 优先输出图片卡片，不可用时回退纯文本
+        if config.get("card_image_enabled", False):
+            path = self._render_card(rows)
+            if path:
+                yield event.chain_result([
+                    Comp.Image.fromFileSystem(path),
+                    Comp.Plain(self._render_group_status(rows)),
+                ])
+                return
+            logger.info("卡片渲染不可用，回退为纯文本输出")
+
         yield event.plain_result(self._render_group_status(rows))
 
+    def _render_card(self, rows: list) -> str | None:
+        """渲染签到卡片图片，失败返回 None"""
+        if not rows:
+            return None
+        try:
+            return self._card.render(rows)
+        except Exception as e:
+            logger.warning(f"卡片渲染失败: {e}")
+            return None
+
     # 群聊状态表的列宽（按显示宽度，中文占 2 列）
-    _GAME_COL = 10
+    _GAME_COL = 15
+    _STATE_COL = 5
     _NAME_MAX = 20
 
     def _render_group_status(self, rows: list) -> str:
         """
-        渲染群聊签到状态表：状态列在前、昵称在后。
+        渲染群聊签到状态表。
 
-        昵称放在最后的好处是状态列宽度固定，昵称长短不影响对齐；
-        同时昵称超长只会在行尾溢出，不会挤动前面的列。
+        一个人一行：绑定了两个游戏时用斜杠横向合并，形如
+        「明日方舟/终末地  ✓/✗  刀客/终末刀客」。
+        斜杠两侧一一对应，不会张冠李戴；未绑定终末地的玩家只显示单游戏。
         """
         if not rows:
             return "📋 森空岛签到\n\n本群还没有人绑定账号"
@@ -807,22 +972,42 @@ class SklandPlugin(Star):
         ak_count = 0
         ef_count = 0
         for r in rows:
-            name = self._truncate(r["name"], self._NAME_MAX)
             if r.get("failed"):
-                lines.append(f"  ⚠️ 查询失败{' ' * 2}·  {name}")
+                name = self._truncate(r.get("name", ""), self._NAME_MAX)
+                lines.append(f"  ⚠️ 查询失败　·  {name}")
                 continue
-            ak = "✓" if r["arknights"] else "✗"
-            ef = "✓" if r["endfield"] else "✗"
+
+            ak_name = self._truncate(r.get("ak_name") or "", self._NAME_MAX)
+            ef_name = self._truncate(r.get("ef_name") or "", self._NAME_MAX)
+            if not ak_name and not ef_name:
+                # 两个游戏都没有昵称时，至少显示兜底名
+                ak_name = self._truncate(r.get("name", ""), self._NAME_MAX)
+
             if r["arknights"]:
                 ak_count += 1
             if r["endfield"]:
                 ef_count += 1
             if r["arknights"] or r["endfield"]:
                 signed_count += 1
+
+            # 只展示实际绑定（有昵称）的游戏，未绑定的不占列
+            if ak_name and ef_name:
+                games = "明日方舟/终末地"
+                states = f"{'✓' if r['arknights'] else '✗'}/{'✓' if r['endfield'] else '✗'}"
+                names = f"{ak_name}/{ef_name}"
+            elif ef_name:
+                games = "终末地"
+                states = "✓" if r["endfield"] else "✗"
+                names = ef_name
+            else:
+                games = "明日方舟"
+                states = "✓" if r["arknights"] else "✗"
+                names = ak_name
+
             lines.append(
-                f"  {ak} {self._pad('明日方舟', self._GAME_COL)}"
-                f" {ef} {self._pad('终末地', self._GAME_COL)}"
-                f"   {name}"
+                f"  {self._pad(games, self._GAME_COL + 1)}"
+                f"{self._pad(states, self._STATE_COL)}"
+                f"  {names}"
             )
 
         total = len(rows)

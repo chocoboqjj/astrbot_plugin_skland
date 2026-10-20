@@ -47,5 +47,18 @@
     "type": "bool",
     "default": false,
     "hint": "开启后群聊 /skd 会实时请求森空岛接口，人数多时较慢且请求量大；关闭时直接读取数据库中最近一次的签到结果"
+  },
+  "card_image_enabled": {
+    "description": "签到卡片图片",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后 /skd 以图片卡片输出签到状态。需要在系统安装中文字体；缺少 Pillow 或中文字体时会自动回退为纯文本输出"
+  },
+  "card_theme": {
+    "description": "卡片主题",
+    "type": "string",
+    "default": "dark",
+    "options": ["dark", "light"],
+    "hint": "dark=深色卡片 / light=浅色卡片，仅在启用图片卡片时生效"
   }
 }

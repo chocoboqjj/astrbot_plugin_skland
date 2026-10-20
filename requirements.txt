@@ -1,3 +1,5 @@
 httpx>=0.25.0
 pycryptodome>=3.19.0
 apscheduler>=3.10.0
+# 可选：启用签到卡片图片时需要（Pillow）。缺失时插件自动回退为纯文本输出。
+Pillow>=10.0.0
