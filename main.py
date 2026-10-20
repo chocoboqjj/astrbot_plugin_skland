@@ -28,6 +28,7 @@ Config (AstrBot plugin config):
 
 import asyncio
 import random
+import re
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -606,22 +607,29 @@ class SklandPlugin(Star):
         "卡片诊断": "skdcheck",
     }
 
-    @staticmethod
-    def _raw_text(event: AstrMessageEvent) -> str:
+    # QQ 官方平台在消息文本里插入的 @ 标记（如 <qqbot-at-user id="xxx" />）
+    _AT_MARKUP = re.compile(
+        r'<\s*qqbot-at-user\s+id="[^"]*"\s*/\s*>|<\s*@\s*[A-Za-z0-9_\-]+\s*>'
+    )
+
+    @classmethod
+    def _raw_text(cls, event: AstrMessageEvent) -> str:
         """
         取消息的原始纯文本。
 
-        不能用 get_message_str()：唤醒检查阶段已对它做过处理，
-        走 At 唤醒分支时会被置空，裸指令文本会丢失。
+        1. 不能用 get_message_str()：唤醒检查阶段已对它做过处理，
+           走 At 唤醒分支时会被置空，裸指令文本会丢失。
+        2. 需要剥掉 QQ 官方平台的 @ 标记：适配器只会剥离「@机器人自己」的
+           标记，@其他人时标记会原样留在文本里，导致指令匹配失败。
         """
         parts = []
         for seg in event.get_messages() or []:
             if type(seg).__name__ == "Plain":
                 parts.append(getattr(seg, "text", "") or "")
-        text = "".join(parts).strip()
+        text = cls._AT_MARKUP.sub(" ", "".join(parts)).strip()
         if text:
             return text
-        return (event.get_message_str() or "").strip()
+        return cls._AT_MARKUP.sub(" ", event.get_message_str() or "").strip()
 
     @staticmethod
     def _is_at_bot(event: AstrMessageEvent) -> bool:
