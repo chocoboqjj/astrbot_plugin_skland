@@ -910,10 +910,8 @@ class SklandPlugin(Star):
             if config.get("card_image_enabled", False):
                 path = self._render_card(self._private_card_rows(user_data))
                 if path:
-                    yield event.chain_result([
-                        Comp.Image.fromFileSystem(path),
-                        Comp.Plain(text),
-                    ])
+                    # 只发图片，不再附带纯文本
+                    yield event.chain_result([Comp.Image.fromFileSystem(path)])
                     return
                 logger.warning("签到卡片渲染不可用，已回退为纯文本输出（发送 /skdcheck 可诊断）")
             yield event.plain_result(text)
@@ -988,10 +986,8 @@ class SklandPlugin(Star):
         if config.get("card_image_enabled", False):
             path = self._render_card(rows)
             if path:
-                yield event.chain_result([
-                    Comp.Image.fromFileSystem(path),
-                    Comp.Plain(self._render_group_status(rows)),
-                ])
+                # 只发图片，不再附带纯文本
+                yield event.chain_result([Comp.Image.fromFileSystem(path)])
                 return
             logger.warning("签到卡片渲染不可用，已回退为纯文本输出（发送 /skdcheck 可诊断）")
 
