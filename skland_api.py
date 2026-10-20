@@ -8,7 +8,6 @@ import gzip
 import hashlib
 import hmac
 import json
-import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,11 +16,17 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-
-logger = logging.getLogger("skland_api")
 from Crypto.Cipher import AES, DES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 from Crypto.Util.Padding import pad
+
+try:
+    # 优先接入 AstrBot 日志系统，保证插件日志统一输出
+    from astrbot.api import logger
+except ImportError:  # 独立运行或测试时回退到标准库
+    import logging
+
+    logger = logging.getLogger("skland_api")
 
 # Constants from Rust source
 USER_AGENT = "Mozilla/5.0 (Linux; Android 12; SM-A5560 Build/V417IR; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/101.0.4951.61 Safari/537.36; SKLand/1.52.1"
@@ -463,8 +468,8 @@ class SklandAPI:
             json_data={"gameId": binding.game_id, "uid": binding.uid},
         )
 
-        # Log the response for debugging
-        logger.info(f"[明日方舟] {binding.nickname} sign-in response: {json.dumps(response, ensure_ascii=False)}")
+        # 降级为 debug，避免每日签到刷屏
+        logger.debug(f"[明日方舟] {binding.nickname} sign-in response: {json.dumps(response, ensure_ascii=False)}")
 
         if response.get("code") != 0:
             return SignInResult(
@@ -523,8 +528,8 @@ class SklandAPI:
             resp = await client.post(url, headers=headers)
             response = resp.json()
 
-            # Log the response for debugging
-            logger.info(f"[终末地] {role_nickname} sign-in response: {json.dumps(response, ensure_ascii=False)}")
+            # 降级为 debug，避免每日签到刷屏
+            logger.debug(f"[终末地] {role_nickname} sign-in response: {json.dumps(response, ensure_ascii=False)}")
 
             if response.get("code") != 0:
                 results.append(

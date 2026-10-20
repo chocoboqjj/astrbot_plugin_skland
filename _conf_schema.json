@@ -2,14 +2,14 @@
   "auto_sign_enabled": {
     "description": "自动签到开关",
     "type": "bool",
-    "default": false,
-    "hint": "开启后，将在指定时间自动为所有已注册用户签到，并私发结果给用户"
+    "default": true,
+    "hint": "开启后，将在指定时间自动为所有已注册用户签到，结果写入数据库"
   },
   "show_player_name": {
     "description": "显示玩家名称",
     "type": "bool",
     "default": true,
-    "hint": "开启后，将在签到结果中默认显示森空岛昵称，否则显示QQ昵称"
+    "hint": "开启后，在签到结果中默认显示森空岛昵称，否则显示平台昵称"
   },
   "auto_sign_hour": {
     "description": "自动签到时间（小时）",
@@ -21,12 +21,31 @@
     "description": "自动签到的延迟，防止风控",
     "type": "int",
     "default": 10,
-    "hint": "将在签到时进行向后随机延迟，0为不限制（随机范围 0 至 设定的秒数）"
+    "hint": "签到时向后随机延迟，0为不限制（随机范围 0 至 设定的秒数）"
   },
   "max_users": {
     "description": "最大登录数量，防止风控",
     "type": "int",
     "default": 10,
-    "hint": "将限制登录账户的数量，0为不限制"
+    "hint": "限制登录账户的数量，0为不限制"
+  },
+  "push_mode": {
+    "description": "推送模式",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "private", "pull"],
+    "hint": "auto=按平台自动判断（OneBot 私聊推送，QQ官方仅落库）；private=强制私聊推送；pull=强制仅落库不推送"
+  },
+  "group_broadcast_enabled": {
+    "description": "自动签到群播报",
+    "type": "bool",
+    "default": false,
+    "hint": "自动签到完成后向已有群播报一次汇总。QQ官方需群主在手机端开启「允许主动发言」，失败会自动静默降级"
+  },
+  "live_query_in_group": {
+    "description": "群聊实时查询",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后群聊 /skd 会实时请求森空岛接口，人数多时较慢且请求量大；关闭时直接读取数据库中最近一次的签到结果"
   }
 }
