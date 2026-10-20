@@ -21,7 +21,8 @@ Commands:
 
 Config (AstrBot plugin config):
 - auto_sign_enabled: 自动签到开关
-- auto_sign_hour: 自动签到时间（小时，0-23）
+- auto_sign_hour: 自动签到时间（小时，0-23），默认 0
+- auto_sign_minute: 自动签到时间（分钟，0-59），默认 30
 - show_player_name: 显示玩家昵称（否则显示平台昵称）
 - auto_sign_delay: 签到延时
 - max_users: 最大用户数量
@@ -95,7 +96,9 @@ class SklandPlugin(Star):
             ("自动签到开关", "auto_sign_enabled", True,
              "开启后，将在指定时间自动为所有已注册用户签到"),
             ("自动签到时间（小时）", "auto_sign_hour", 0,
-             "自动签到执行的小时（0-23），默认 0 点（每日 0 点重置并签到）"),
+             "自动签到执行的小时（0-23）。签到状态每日 0 点重置，实际签到安排在此后的时间"),
+            ("自动签到时间（分钟）", "auto_sign_minute", 30,
+             "自动签到执行的分钟（0-59），默认 30 即 0:30 执行"),
             ("显示玩家名称", "show_player_name", True,
              "开启后显示森空岛昵称，否则显示平台昵称"),
             ("自动签到的延迟", "auto_sign_delay", 10,
@@ -127,6 +130,7 @@ class SklandPlugin(Star):
         return {
             "auto_sign_enabled": self.config.get("auto_sign_enabled", True),
             "auto_sign_hour": self.config.get("auto_sign_hour", 0),
+            "auto_sign_minute": self.config.get("auto_sign_minute", 30),
             "show_player_name": self.config.get("show_player_name", True),
             "auto_sign_delay": self.config.get("auto_sign_delay", 10),
             "max_users": self.config.get("max_users", 10),
@@ -353,7 +357,10 @@ class SklandPlugin(Star):
         await self._migrate_storage()
         config = self._get_config()
         if config.get("auto_sign_enabled", False):
-            self._start_auto_sign_job(config.get("auto_sign_hour", 9))
+            self._start_auto_sign_job(
+                config.get("auto_sign_hour", 0),
+                config.get("auto_sign_minute", 30),
+            )
         if not self.scheduler.running:
             self.scheduler.start()
 
@@ -366,10 +373,16 @@ class SklandPlugin(Star):
 
     # ==================== Auto Sign-In ====================
 
-    def _start_auto_sign_job(self, hour: int = 9):
-        """启动自动签到定时任务"""
+    def _start_auto_sign_job(self, hour: int = 0, minute: int = 30):
+        """
+        启动自动签到定时任务。
+
+        签到状态在每日 0 点随日期自然重置（last_sign 存的是日期），
+        实际签到安排在 0 点之后（默认 0:30），避开整点的接口高峰。
+        """
         hour = max(0, min(23, int(hour)))
-        trigger = CronTrigger(hour=hour, minute=0)
+        minute = max(0, min(59, int(minute)))
+        trigger = CronTrigger(hour=hour, minute=minute)
         try:
             self.scheduler.remove_job("skland_auto_sign")
         except Exception:
@@ -381,7 +394,7 @@ class SklandPlugin(Star):
             id="skland_auto_sign",
             misfire_grace_time=3600,
         )
-        logger.info(f"森空岛自动签到任务已启动，每天 {hour:02d}:00 执行")
+        logger.info(f"森空岛自动签到任务已启动，每天 {hour:02d}:{minute:02d} 执行")
 
     @staticmethod
     def _mark_signed(user_data: dict, results: list, today: str) -> None:

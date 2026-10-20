@@ -15,7 +15,13 @@
     "description": "自动签到时间（小时）",
     "type": "int",
     "default": 0,
-    "hint": "自动签到执行的小时（0-23），默认 0 点（每日 0 点重置签到状态并执行签到）"
+    "hint": "自动签到执行的小时（0-23）。签到状态每日 0 点重置，实际签到安排在此后的时间"
+  },
+  "auto_sign_minute": {
+    "description": "自动签到时间（分钟）",
+    "type": "int",
+    "default": 30,
+    "hint": "自动签到执行的分钟（0-59），默认 30 即 0:30 执行"
   },
   "auto_sign_delay": {
     "description": "自动签到的延迟，防止风控",
