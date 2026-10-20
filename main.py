@@ -255,12 +255,170 @@ class SklandPlugin(Star):
         return []
 
     @staticmethod
+    def _normalize_accounts_inplace(user_data: dict) -> int:
+        """
+        就地规范化该用户所有账号的 token，返回被修改的账号数。
+
+        `_get_accounts` 对旧结构返回的是新建的 dict，改它不会影响原数据；
+        清理存量脏 token 时必须用这个方法才能真正写回。
+        """
+        changed = 0
+        accounts = user_data.get("accounts")
+        if isinstance(accounts, list):
+            for acc in accounts:
+                if not isinstance(acc, dict):
+                    continue
+                tok = acc.get("token")
+                if not tok:
+                    continue
+                norm = SklandPlugin._normalize_token(tok)
+                if norm != tok:
+                    acc["token"] = norm
+                    changed += 1
+            return changed
+        # 旧结构：token 挂在顶层
+        tok = user_data.get("token")
+        if tok:
+            norm = SklandPlugin._normalize_token(tok)
+            if norm != tok:
+                user_data["token"] = norm
+                changed += 1
+        return changed
+
+    # 复制粘贴可能带入的不可见字符（用转义码写，避免源码里出现裸字符）
+    # U+200B 零宽空格 / U+200C 零宽非连接符 / U+200D 零宽连接符
+    # U+200E LRM / U+200F RLM / U+2060 单词连接符
+    # U+FEFF BOM / U+00AD 软连字符
+    _INVISIBLE_CHARS = (
+        "\u200b\u200c\u200d"   # 零宽空格 / 零宽非连接符 / 零宽连接符
+        "\u200e\u200f\u2060"   # LRM / RLM / 单词连接符
+        "\ufeff\u00ad"         # BOM / 软连字符
+        "\u202a\u202b\u202c\u202d\u202e"  # 方向控制标记
+        "\u2066\u2067\u2068\u2069"        # 方向隔离标记
+    )
+
+    @staticmethod
+    def _normalize_token(token: str) -> str:
+        """
+        规范化 token，去除复制粘贴可能带入的隐形字符。
+
+        森空岛 token 形如 "N6QKb2C3d4A1b2C3d4"。用户在 QQ 里复制粘贴时
+        常混入零宽空格、全角空格、方向标记等不可见字符，导致同一个 token
+        被当成两个不同账号 —— 这正是「登录两次出现重复」的常见原因。
+
+        只做保守清理，不改变 token 本身的可打印字符。
+        """
+        if not token:
+            return ""
+        cleaned = "".join(
+            ch for ch in token
+            if ch not in SklandPlugin._INVISIBLE_CHARS
+        )
+        # 去掉所有空白（含全角空格 U+3000）
+        cleaned = "".join(ch for ch in cleaned if not ch.isspace())
+        return cleaned.strip()
+
+    @staticmethod
     def _find_account_by_token(user_data: dict, token: str) -> dict | None:
         """按 token 找出已存在的账号"""
         for acc in SklandPlugin._get_accounts(user_data):
             if acc.get("token") == token:
                 return acc
         return None
+
+    @staticmethod
+    def _count_real_users(users: dict) -> int:
+        """
+        统计真实用户数（排除别名记录）。
+
+        别名记录是跨平台指向主记录的轻量条目（只有 alias 字段、无账号），
+        不应计入用户总数。
+        """
+        return sum(
+            1 for d in users.values()
+            if isinstance(d, dict) and SklandPlugin._get_accounts(d)
+        )
+
+    @staticmethod
+    def _find_user_by_token(users: dict, token: str, exclude: str = "") -> str:
+        """
+        在所有用户记录中查找持有该 token 的用户键。
+
+        同一个人可能从不同平台（OneBot 的 QQ 号 / QQ 官方的 openid）
+        分别登录，若不归一会产生两条记录、各持一份相同 token，
+        列表里就出现重复账号。
+
+        比较时**双方都做规范化**：历史数据里可能存着带隐形字符的脏 token，
+        规范化后应视为同一个账号。
+        """
+        norm = SklandPlugin._normalize_token(token)
+        for uid, data in users.items():
+            if uid == exclude:
+                continue
+            if not isinstance(data, dict):
+                continue
+            for acc in SklandPlugin._get_accounts(data):
+                raw = acc.get("token")
+                if not raw:
+                    continue
+                if raw == token or SklandPlugin._normalize_token(raw) == norm:
+                    return uid
+        return ""
+
+    @staticmethod
+    def _merge_user_account(users: dict, target_id: str, source_id: str,
+                            account: dict) -> str:
+        """
+        把 source_id 用户的账号合并到 target_id，并删除 source_id 记录。
+
+        用于跨平台登录同一森空岛账号时合并记录，返回被合并掉的原用户键。
+        """
+        source = users.get(source_id)
+        if not isinstance(source, dict):
+            return source_id
+        target = users.get(target_id)
+        if not isinstance(target, dict):
+            # 目标记录不存在（如跨平台首次登录），以 source 为基础新建
+            target = {}
+
+        # 合并平台绑定信息
+        umo_map = dict(target.get("umo_by_platform") or {})
+        for plat, umo in (source.get("umo_by_platform") or {}).items():
+            umo_map.setdefault(plat, umo)
+        target["umo_by_platform"] = umo_map
+        target["umo"] = target.get("umo") or source.get("umo", "")
+        target.setdefault("last_username",
+                          source.get("last_username", ""))
+
+        # 合并账号列表：按规范化 token 去重，脏 token 统一清理
+        accounts = list(target.get("accounts") or [])
+        for a in accounts:
+            if a.get("token"):
+                a["token"] = SklandPlugin._normalize_token(a["token"])
+        existing = {a.get("token") for a in accounts}
+        for acc in SklandPlugin._get_accounts(source):
+            raw = acc.get("token")
+            if not raw:
+                continue
+            norm = SklandPlugin._normalize_token(raw)
+            if norm in existing:
+                # 同一个 token：保留目标记录的状态，但补上来源的昵称
+                for a in accounts:
+                    if a.get("token") == norm:
+                        if not a.get("nickname"):
+                            a["nickname"] = acc.get("nickname", "")
+                        if not a.get("game_names"):
+                            a["game_names"] = acc.get("game_names") or {}
+                continue
+            acc["token"] = norm
+            accounts.append(acc)
+            existing.add(norm)
+        target["accounts"] = accounts
+        SklandPlugin._upsert_account(target, account)
+
+        users[target_id] = target
+        users.pop(source_id, None)
+        return source_id
 
     @staticmethod
     def _upsert_account(user_data: dict, account: dict) -> list[dict]:
@@ -285,8 +443,17 @@ class SklandPlugin(Star):
                 })
 
         token = account.get("token")
+        if not token:
+            # 没有 token 的空账号不写入（如合并时只传平台信息）
+            user_data["accounts"] = accounts
+            return accounts
+
+        # 按**规范化后的 token** 匹配：历史数据里可能存着带隐形字符的脏 token，
+        # 若用精确比较，重复执行同一次 login 就会不断追加出「重复账号」
+        norm = SklandPlugin._normalize_token(token)
+        account["token"] = norm
         for acc in accounts:
-            if acc.get("token") == token:
+            if acc.get("token") == norm:
                 acc.update(account)
                 break
         else:
@@ -804,6 +971,8 @@ class SklandPlugin(Star):
         "登出": "skdlogout",
         "skdlogin": "skdlogin",
         "登录": "skdlogin",
+        "skdmerge": "skdmerge",
+        "合并重复": "skdmerge",
     }
 
     # QQ 官方平台在消息文本里插入的 @ 标记（如 <qqbot-at-user id="xxx" />）
@@ -883,6 +1052,9 @@ class SklandPlugin(Star):
         elif target == "skdlogin":
             async for res in self.skdlogin(event, arg):
                 yield res
+        elif target == "skdmerge":
+            async for res in self.skdmerge(event):
+                yield res
 
     @filter.command("skdhelp")
     async def skdhelp(self, event: AstrMessageEvent):
@@ -894,6 +1066,7 @@ class SklandPlugin(Star):
             "3. /skd 查看签到状态\n"
             "4. /skdusers 查看绑定统计\n"
             "5. /skdcheck 查看签到卡片图片的可用状态\n"
+            "6. /skdmerge 合并重复账号记录（仅管理员）\n"
             "注：token 等同账号密码，群聊中发送后插件会自动撤回该条消息\n"
             "多账号：多次 /skdlogin 可绑定多个森空岛账号，\n"
             "     列表中同一游戏的角色名用 / 分隔；\n"
@@ -951,6 +1124,89 @@ class SklandPlugin(Star):
 
         yield event.plain_result("\n".join(lines))
 
+    @filter.command("skdmerge")
+    async def skdmerge(self, event: AstrMessageEvent):
+        """
+        检测并合并重复账号记录。
+
+        同一个人可能从不同平台（OneBot 的 QQ 号 / QQ 官方的 openid）
+        分别登录，若未归一会产生两条记录、各持一份相同 token，
+        签到列表里就会出现重复账号。本指令把相同 token 的记录合并。
+        """
+        if not event.is_admin():
+            yield event.plain_result("该指令仅管理员可用")
+            return
+
+        users = await self.get_kv_data("users", {})
+        groups = await self.get_kv_data("groups", {})
+
+        # 按「规范化后的 token」归组：脏 token（含隐形字符）规范化后
+        # 应与干净 token 归为同一组，否则存量重复清理不出来
+        token_owner: dict[str, str] = {}
+        dup_groups: dict[str, list[str]] = {}
+        dirty_tokens = 0
+        for uid, data in users.items():
+            if not isinstance(data, dict):
+                continue
+            # 就地规范化（旧结构也能写回）
+            dirty_tokens += self._normalize_accounts_inplace(data)
+            for acc in self._get_accounts(data):
+                tok = acc.get("token")
+                if not tok:
+                    continue
+                norm = self._normalize_token(tok)
+                if norm in token_owner:
+                    dup_groups.setdefault(norm, [token_owner[norm]]).append(uid)
+                else:
+                    token_owner[norm] = uid
+
+        if not dup_groups:
+            msg = (
+                f"当前共 {self._count_real_users(users)} 个用户记录，"
+                f"{len(token_owner)} 个不同的森空岛账号"
+            )
+            if dirty_tokens:
+                await self.put_kv_data("users", users)
+                msg += f"\n🧹 已规范化 {dirty_tokens} 个含隐形字符的 token"
+            yield event.plain_result(f"✅ 未发现重复账号记录\n{msg}")
+            return
+
+        lines = [
+            f"🔍 发现 {len(dup_groups)} 组重复账号：",
+            "═══════════════",
+        ]
+        merged = 0
+        for tok, uids in dup_groups.items():
+            # 保留第一个，其余合并进去
+            keep = uids[0]
+            for other in uids[1:]:
+                self._merge_user_account(users, keep, other, {})
+                merged += 1
+                # 同步群成员列表
+                for meta in groups.values():
+                    if not isinstance(meta, dict):
+                        continue
+                    members = meta.get("members") or []
+                    if other in members:
+                        members.remove(other)
+                        if keep not in members:
+                            members.append(keep)
+            names = "、".join(
+                (users.get(u, {}).get("nickname")
+                 or users.get(u, {}).get("last_username") or u)
+                for u in uids if u in users
+            ) or "、".join(uids)
+            lines.append(f"  • {names}（token {tok[:6]}***）")
+            lines.append("    → 已合并为 1 条记录")
+
+        await self.put_kv_data("users", users)
+        await self.put_kv_data("groups", groups)
+        logger.info(f"skdmerge: 合并了 {merged} 条重复用户记录")
+        lines.append("═══════════════")
+        lines.append(f"✅ 已合并 {merged} 条重复记录，当前 {self._count_real_users(users)} 个用户")
+
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("skdlogin")
     async def skdlogin(self, event: AstrMessageEvent, token: str = ""):
         """
@@ -967,7 +1223,9 @@ class SklandPlugin(Star):
         users = await self.get_kv_data("users", {})
         user_id = self._resolve_user_key(users, event.get_sender_id())
 
-        token = (token or "").strip()
+        # 规范化 token：去掉复制粘贴可能带入的隐形字符，
+        # 否则同一个 token 会被当成两个不同账号
+        token = self._normalize_token(token)
         if not token:
             yield event.plain_result(
                 "请先获取token，方法如下:\n"
@@ -983,11 +1241,29 @@ class SklandPlugin(Star):
             return
 
         max_users = config.get("max_users", 10)
-        if user_id not in users and max_users > 0 and len(users) >= max_users:
+        if (user_id not in users and max_users > 0
+                and self._count_real_users(users) >= max_users):
             yield event.plain_result(
                 f"❌ 绑定失败：已达到最大用户数限制（{max_users}个）\n请联系管理员调整配置"
             )
             return
+
+        # 全局唯一：一个 token 只应存在于一条用户记录中。
+        # 若该 token 已绑定在别的记录下（跨平台登录同一账号），
+        # 直接复用那条记录，而不是新建 —— 从根上避免重复。
+        duplicate_of = self._find_user_by_token(users, token, exclude="")
+        merged_note = ""
+        if duplicate_of and duplicate_of != user_id:
+            logger.info(
+                f"用户 {user_id} 提交的 token 已绑定在 {duplicate_of}，"
+                f"复用该记录以避免重复"
+            )
+            user_id = duplicate_of
+            merged_note = (
+                "\n\n🔗 该账号此前已在其他平台绑定，已复用原记录（不会重复）"
+            )
+        elif duplicate_of == user_id:
+            merged_note = "\n\n🔗 该账号此前已绑定，本次为更新签到状态"
 
         yield event.plain_result("正在登录并签到，请稍候...")
         try:
@@ -1004,6 +1280,16 @@ class SklandPlugin(Star):
             umo_map[platform] = event.unified_msg_origin
             user_data["umo_by_platform"] = umo_map
             user_data["umo"] = event.unified_msg_origin
+
+            # 复用记录时，为当前平台的 sender_id 建立一条轻量别名记录，
+            # 使其能通过 _resolve_user_key 解析到这条主记录。
+            # 别名记录不含 token，签到名单遍历时会自动跳过。
+            sender_id = event.get_sender_id()
+            if sender_id and sender_id != user_id and sender_id not in users:
+                users[sender_id] = {
+                    "alias": {"uid": user_id},
+                    "last_username": user_name,
+                }
 
             # 每个 token 是一个独立账号：同 token 视为更新，新 token 追加
             is_new_account = self._find_account_by_token(user_data, token) is None
@@ -1029,6 +1315,19 @@ class SklandPlugin(Star):
             account_count = len(accounts)
 
             users[user_id] = user_data
+
+            # 复用记录时，需要把当前平台的绑定也挂到这条记录上
+            if duplicate_of and duplicate_of != user_id:
+                groups = await self.get_kv_data("groups", {})
+                for meta in groups.values():
+                    if not isinstance(meta, dict):
+                        continue
+                    members = meta.get("members") or []
+                    if user_id not in members:
+                        members.append(user_id)
+                        meta["members"] = members
+                await self.put_kv_data("groups", groups)
+
             await self.put_kv_data("users", users)
 
             # 登录是全局行为：同步到所有已知群，保证各群名单一致
@@ -1059,7 +1358,8 @@ class SklandPlugin(Star):
                 head = "登录成功！"
             else:
                 head = "登录成功！（已更新该账号的签到状态）"
-            yield event.plain_result(f"{head}\n{body}{notice}{recall_note}")
+            yield event.plain_result(
+                f"{head}\n{body}{notice}{recall_note}{merged_note}")
         except Exception as e:
             logger.error(f"skdlogin失败: {e}")
             # 失败时也要撤回，防止 token 留在群里
@@ -1235,24 +1535,28 @@ class SklandPlugin(Star):
         ]
 
         today = datetime.now().strftime("%Y-%m-%d")
+        # 别名记录（跨平台指向主记录）不计入用户数
+        real_users = {uid: d for uid, d in users.items()
+                      if isinstance(d, dict) and self._get_accounts(d)}
         signed_today = sum(
-            1 for d in users.values()
+            1 for d in real_users.values()
             if any(v == today for v in (d.get("last_sign") or {}).values())
         )
+        total_users = len(real_users)
 
         lines = [
             "📊 森空岛签到用户统计",
             "═══════════════════",
-            f"📝 总注册用户: {len(users)} 人",
+            f"📝 总注册用户: {total_users} 人",
             f"✅ 今日已签到: {signed_today} 人",
-            f"📉 未签到用户: {len(users) - signed_today} 人",
+            f"📉 未签到用户: {total_users - signed_today} 人",
             f"🔌 当前平台: {platform}",
         ]
 
         if event.is_admin():
             if max_users > 0:
                 lines.append(f"🎯 最大限制: {max_users} 人")
-                lines.append(f"🆓 剩余名额: {max(0, max_users - len(users))} 人")
+                lines.append(f"🆓 剩余名额: {max(0, max_users - self._count_real_users(users))} 人")
             lines.append(f"📤 推送模式: {config.get('push_mode', 'auto')}"
                          f"（本平台可推送: {self._can_push(platform)}）")
 
@@ -1260,9 +1564,12 @@ class SklandPlugin(Star):
                 if group_stats:
                     lines.append("\n📌 群聊分布（仅代表群内同玩的数量）:")
                     lines.extend(group_stats)
-                if len(users) <= 20:
+                if self._count_real_users(users) <= 20:
                     lines.append("\n👤 用户列表:")
                     for uid, d in users.items():
+                        # 跳过别名记录（无账号，仅指向主记录）
+                        if not isinstance(d, dict) or not self._get_accounts(d):
+                            continue
                         nick = d.get("nickname") or d.get("last_username", "未知")
                         bound = "、".join((d.get("umo_by_platform") or {}).keys()) \
                             or d.get("platform_name", "-")
@@ -1314,8 +1621,10 @@ class SklandPlugin(Star):
         meta["umo"] = event.unified_msg_origin
         meta["platform"] = platform
         members = list(meta.get("members") or [])
-        if sender_id in users_data and sender_id not in members:
-            members.append(sender_id)
+        # 群成员统一存「主记录键」，与 _find_user_groups 的查询口径一致
+        member_key = self._resolve_user_key(users_data, sender_id)
+        if member_key in users_data and member_key not in members:
+            members.append(member_key)
         meta["members"] = members
 
         live = config.get("live_query_in_group", False)
