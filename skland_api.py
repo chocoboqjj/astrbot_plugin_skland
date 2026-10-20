@@ -163,17 +163,99 @@ class SklandAPI:
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                if attempt == 1:
+                    self._log_request(method, url, headers, json_data)
                 if method.upper() == "GET":
                     resp = await client.get(url, headers=headers)
                 else:
                     resp = await client.post(url, headers=headers, json=json_data)
-                return resp.json()
+                data = resp.json()
+                self._log_response(method, url, resp, data, attempt)
+                return data
             except Exception as e:
                 last_error = e
+                logger.warning(
+                    f"[森空岛] 请求失败 {method} {url} "
+                    f"(第 {attempt}/{self.max_retries} 次): {e}"
+                )
                 if attempt < self.max_retries:
                     await self._sleep(1)
 
         raise last_error or Exception(f"Request failed after {self.max_retries} attempts")
+
+    def _log_response(self, method: str, url: str, resp, data, attempt: int) -> None:
+        """
+        打印接口的原始返回，便于排查森空岛接口变更。
+
+        敏感字段（token / cred / sign / dId 等）已脱敏，不会出现在日志中。
+        """
+        body = self._safe_json(data)
+        if len(body) > 2000:
+            body = body[:2000] + f"...(共 {len(body)} 字符)"
+
+        logger.info(
+            f"[森空岛] {method} {url} -> {resp.status_code} "
+            f"(第 {attempt} 次尝试)\n{body}"
+        )
+
+    # 日志中需要脱敏的字段（无论出现在哪一层）
+    _SENSITIVE_KEYS = {
+        "token", "cred", "sign", "dId", "ep",
+        "content", "authorization", "password", "secret", "deviceId",
+    }
+
+    def _safe_json(self, obj, limit: int = 2000) -> str:
+        """序列化为 JSON 字符串，敏感字段脱敏"""
+        try:
+            return json.dumps(self._mask(obj), ensure_ascii=False)
+        except (TypeError, ValueError):
+            return repr(obj)
+
+    def _mask(self, obj, parent_key: str = ""):
+        """
+        递归脱敏敏感字段。
+
+        注意区分同名的不同含义：
+        - 顶层 `code` 是接口状态码（0 为成功），保留便于排查
+        - `data.code` 是 oauth 授权码，需要脱敏
+        - `data` 本身通常是业务数据，不脱敏
+        """
+        if isinstance(obj, dict):
+            masked = {}
+            for k, v in obj.items():
+                if k in self._SENSITIVE_KEYS and isinstance(v, str) and v:
+                    masked[k] = self._hide(v)
+                elif k == "code" and parent_key == "data" and isinstance(v, str) and v:
+                    masked[k] = self._hide(v)
+                else:
+                    masked[k] = self._mask(v, k)
+            return masked
+        if isinstance(obj, list):
+            return [self._mask(i, parent_key) for i in obj]
+        return obj
+
+    @staticmethod
+    def _hide(value: str) -> str:
+        """保留首尾各 4 位，中间用 *** 代替"""
+        if len(value) > 10:
+            return f"{value[:4]}***{value[-4:]}"
+        return "***"
+
+    def _log_request(self, method: str, url: str, headers: dict | None,
+                     json_data: dict | None) -> None:
+        """打印请求参数（敏感字段已脱敏）"""
+        parts = [f"[森空岛] -> {method} {url}"]
+        if json_data:
+            parts.append(f"  请求体: {self._safe_json(json_data)}")
+        if headers:
+            safe_headers = {}
+            for k, v in headers.items():
+                if k in self._SENSITIVE_KEYS and isinstance(v, str) and v:
+                    safe_headers[k] = self._hide(v)
+                else:
+                    safe_headers[k] = v
+            parts.append(f"  请求头: {json.dumps(safe_headers, ensure_ascii=False)}")
+        logger.info("\n".join(parts))
 
     async def _sleep(self, seconds: float):
         import asyncio
@@ -468,8 +550,8 @@ class SklandAPI:
             json_data={"gameId": binding.game_id, "uid": binding.uid},
         )
 
-        # 降级为 debug，避免每日签到刷屏
-        logger.debug(f"[明日方舟] {binding.nickname} sign-in response: {json.dumps(response, ensure_ascii=False)}")
+        # 响应体已由 _log_response 统一打印，这里补充角色信息便于定位
+        logger.info(f"[森空岛] 明日方舟签到：{binding.nickname}（角色 {binding.uid}）")
 
         if response.get("code") != 0:
             return SignInResult(
@@ -524,12 +606,10 @@ class SklandAPI:
             headers["referer"] = "https://game.skland.com/"
             headers["origin"] = "https://game.skland.com/"
 
-            client = await self._get_client()
-            resp = await client.post(url, headers=headers)
-            response = resp.json()
+            # 走统一的 _request，响应日志与重试逻辑统一处理
+            response = await self._request("POST", url, headers=headers)
 
-            # 降级为 debug，避免每日签到刷屏
-            logger.debug(f"[终末地] {role_nickname} sign-in response: {json.dumps(response, ensure_ascii=False)}")
+            logger.info(f"[森空岛] 终末地签到：{role_nickname}（角色 {role_id}）")
 
             if response.get("code") != 0:
                 results.append(

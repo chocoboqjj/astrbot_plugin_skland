@@ -79,6 +79,7 @@ class CardRenderer:
     """签到状态卡片渲染器"""
 
     def __init__(self, theme: str = "dark"):
+        self.theme_name = "light" if theme == "light" else "dark"
         self.theme = THEME_LIGHT if theme == "light" else THEME_DARK
         self.font_path = _find_font()
         self.bold_index = _pick_bold_index(self.font_path) if self.font_path else 0

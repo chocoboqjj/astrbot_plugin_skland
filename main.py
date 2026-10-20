@@ -82,7 +82,6 @@ class SklandPlugin(Star):
         self.scheduler = AsyncIOScheduler()
         self._card = CardRenderer(theme=self.config.get("card_theme", "dark"))
         self._init_config()
-
     # ==================== Config ====================
 
     def _init_config(self):
@@ -603,6 +602,8 @@ class SklandPlugin(Star):
         "帮助": "skdhelp",
         "skdusers": "skdusers",
         "签到统计": "skdusers",
+        "skdcheck": "skdcheck",
+        "卡片诊断": "skdcheck",
     }
 
     @staticmethod
@@ -664,6 +665,9 @@ class SklandPlugin(Star):
         elif target == "skdusers":
             async for res in self.skdusers(event):
                 yield res
+        elif target == "skdcheck":
+            async for res in self.skdcheck(event):
+                yield res
 
     @filter.command("skdhelp")
     async def skdhelp(self, event: AstrMessageEvent):
@@ -673,8 +677,60 @@ class SklandPlugin(Star):
             "1. 私聊机器人发送 /skdlogin <token> 登录并签到\n"
             "2. 私聊机器人发送 /skdlogout 登出\n"
             "3. /skd 查看签到状态\n"
-            "4. /skdusers 查看绑定统计"
+            "4. /skdusers 查看绑定统计\n"
+            "5. /skdcheck 查看签到卡片图片的可用状态"
         )
+
+    @filter.command("skdcheck")
+    async def skdcheck(self, event: AstrMessageEvent):
+        """诊断签到卡片图片是否可用"""
+        config = self._get_config()
+        enabled = config.get("card_image_enabled", False)
+        theme = config.get("card_theme", "dark")
+
+        try:
+            import PIL
+            pillow_ver = PIL.__version__
+            has_pillow = True
+        except ImportError:
+            pillow_ver = "-"
+            has_pillow = False
+
+        card = self._card
+        has_font = bool(card.font_path)
+
+        lines = ["🔍 签到卡片诊断", "═══════════════"]
+        lines.append(f"图片开关: {'✅ 已开启' if enabled else '❌ 未开启'}")
+        if not enabled:
+            lines.append("　　→ 在 WebUI「插件配置」中开启「签到卡片图片」")
+        lines.append(f"卡片主题: {theme}")
+        lines.append(f"Pillow: {'✅ 已安装 ' + pillow_ver if has_pillow else '❌ 未安装'}")
+        if not has_pillow:
+            lines.append("　　→ 执行 pip install Pillow")
+        lines.append(f"中文字体: {'✅ ' + card.font_path if has_font else '❌ 未找到'}")
+        if not has_font:
+            lines.append("　　→ Debian/Ubuntu: apt install fonts-noto-cjk")
+            lines.append("　　→ Alpine: apk add font-noto-cjk")
+            lines.append("　　→ 或在 config/ 中放置任意中文字体 ttf/ttc")
+
+        if enabled and has_pillow and has_font:
+            test_rows = [{
+                "name": "测试", "ak_name": "测试", "ef_name": "",
+                "arknights": True, "endfield": False,
+                "ak_awards": ["示例"], "ef_awards": [],
+            }]
+            try:
+                path = self._render_card(test_rows)
+                if path:
+                    lines.append(f"渲染测试: ✅ 成功（{path}）")
+                else:
+                    lines.append("渲染测试: ❌ 失败，请查看 AstrBot 日志")
+            except Exception as e:
+                lines.append(f"渲染测试: ❌ 异常 {e}")
+        elif not enabled:
+            lines.append("渲染测试: ⏭ 跳过（图片开关未开启）")
+
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("skdlogin")
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
@@ -858,7 +914,7 @@ class SklandPlugin(Star):
                         Comp.Plain(text),
                     ])
                     return
-                logger.info("卡片渲染不可用，回退为纯文本输出")
+                logger.warning("签到卡片渲染不可用，已回退为纯文本输出（发送 /skdcheck 可诊断）")
             yield event.plain_result(text)
             return
 
@@ -936,7 +992,7 @@ class SklandPlugin(Star):
                     Comp.Plain(self._render_group_status(rows)),
                 ])
                 return
-            logger.info("卡片渲染不可用，回退为纯文本输出")
+            logger.warning("签到卡片渲染不可用，已回退为纯文本输出（发送 /skdcheck 可诊断）")
 
         yield event.plain_result(self._render_group_status(rows))
 
@@ -945,6 +1001,16 @@ class SklandPlugin(Star):
         if not rows:
             return None
         try:
+            # 主题按当前配置取，WebUI 改配置后无需重启插件
+            theme = self._get_config().get("card_theme", "dark")
+            if theme != self._card.theme_name:
+                self._card = CardRenderer(theme=theme)
+            if not self._card.available:
+                logger.warning(
+                    "签到卡片不可用：缺少 Pillow 或中文字体，"
+                    "请安装 Pillow 并在系统安装中文字体（如 fonts-noto-cjk）"
+                )
+                return None
             return self._card.render(rows)
         except Exception as e:
             logger.warning(f"卡片渲染失败: {e}")

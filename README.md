@@ -15,6 +15,7 @@
 - **skdlogout** (私聊):  登出并移除 token
 - **skdusers** (全部):   查询用户统计，普通用户仅显示签到人数和名额
 - **skdhelp** (全部):    查看帮助
+- **skdcheck** (全部):   诊断签到卡片图片是否可用（缺依赖时会给出安装指引）
 
 ## 使用
 
@@ -108,6 +109,44 @@ QQ 官方机器人与 OneBot 的能力差异较大，本插件会**自动识别�
 > ```
 >
 > **字体缺失或 Pillow 未安装时，插件会自动回退为纯文本输出**，不会报错也不会影响签到功能。
+
+### 图片没出来？先跑 /skdcheck
+
+如果 `/skd` 返回的还是文字而不是图片，发送 `/skdcheck` 诊断：
+
+```
+🔍 签到卡片诊断
+═══════════════
+图片开关: ✅ 已开启
+卡片主题: dark
+Pillow: ✅ 已安装 12.3.0
+中文字体: ✅ /System/Library/Fonts/Hiragino Sans GB.ttc
+渲染测试: ✅ 成功（/tmp/skland_card_xxx.png）
+```
+
+它会逐项列出问题并给出对应的安装命令。常见情况：
+
+| 诊断输出 | 处理方式 |
+|---------|---------|
+| 图片开关 ❌ 未开启 | WebUI →「插件配置」→ 勾选「签到卡片图片」 |
+| Pillow ❌ 未安装 | `pip install Pillow`（AstrBot 通常会自动装） |
+| 中文字体 ❌ 未找到 | 见上方 Docker 部署说明 |
+| 渲染测试 ❌ 失败 | 查看 AstrBot 日志中的 `卡片渲染失败` 报错 |
+
+### 接口日志
+
+所有森空岛接口的请求参数与原始返回都会打在 AstrBot 日志里（`[森空岛]` 前缀），便于排查接口变更或签到失败：
+
+```
+[森空岛] -> POST https://as.hypergryph.com/user/oauth2/v2/grant
+  请求体: {"appCode": "4ca99fa6b56cc2ba", "token": "ABCD***MNOP", "type": 0}
+[森空岛] POST https://as.hypergryph.com/user/oauth2/v2/grant -> 200 (第 1 次尝试)
+{"status": 0, "data": {"code": "AUTH***3456"}}
+```
+
+**敏感字段会自动脱敏**（保留首尾各 4 位）：用户 token、cred、sign、dId、deviceId、授权码等。接口状态码与业务数据（如奖励列表）完整保留，不会被误遮。
+
+> 响应超过 2000 字符会截断，避免刷屏。
 
 ## 从 v1.4.0 升级
 
