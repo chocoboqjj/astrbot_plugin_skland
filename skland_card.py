@@ -252,7 +252,8 @@ class CardRenderer:
         """
         渲染签到卡片。
 
-        rows: [{"name": str, "arknights": bool, "endfield": bool, "awards": list[str]}]
+        rows: [{"name": str, "ak_name": str, "ef_name": str,
+                "arknights": bool, "endfield": bool}]
         返回临时图片路径；不可用或失败时返回 None，由调用方回退纯文本。
         """
         if not self.available:
@@ -265,7 +266,7 @@ class CardRenderer:
 
         try:
             c = self.theme
-            W, PAD, ROW = 720, 44, 66
+            W, PAD, ROW = 720, 44, 54
 
             # 一个人占一行，先算行数再决定画布高度
             entry_count = sum(
@@ -349,20 +350,7 @@ class CardRenderer:
                 self._text(d, (x, y), label, 23, c["text"], bold=True)
 
                 # 奖励按游戏归属，各自显示在对应游戏名下方
-                ak_awards = r.get("ak_awards") or []
-                ef_awards = r.get("ef_awards") or []
-                if not ak_awards and not ef_awards:
-                    # 兼容旧数据：只有单一 awards 字段时归到方舟
-                    ak_awards = r.get("awards") or []
-                if ak_awards or ef_awards:
-                    # 与游戏列对齐：方舟奖励在游戏名下方，终末地奖励右移
-                    game_col = PAD + 58
-                    ef_col = game_col + 96 + 18
-                    if ak_awards:
-                        self._text(d, (game_col, y + 32), "  ".join(str(a) for a in ak_awards), 15, c["muted"])
-                    if ef_awards:
-                        self._text(d, (ef_col, y + 32), "  ".join(str(a) for a in ef_awards), 15, c["muted"])
-
+                # 奖励道具名称不展示
                 y += ROW
 
             d.rectangle([PAD, H - 64, W - PAD, H - 63], fill=c["div"])

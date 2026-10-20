@@ -406,6 +406,29 @@ class SklandPlugin(Star):
         return [k for k, v in groups.items()
                 if isinstance(v, dict) and user_id in (v.get("members") or [])]
 
+    @staticmethod
+    def _sync_user_to_groups(groups: dict, user_id: str) -> list[str]:
+        """
+        把用户加入所有已知的群记录。
+
+        群成员名单原先只在「用户自己发过 /skd」时追加，导致：
+        - 登录后不主动发 skd，别人发 skd 时看不到这个人
+        - 只在群 A 发过，群 B 的名单里就没有他
+
+        登录属于全局行为，绑定后同步到所有已知群，各群名单才能一致。
+        返回实际加入的群键列表。
+        """
+        added = []
+        for key, meta in groups.items():
+            if not isinstance(meta, dict):
+                continue
+            members = list(meta.get("members") or [])
+            if user_id not in members:
+                members.append(user_id)
+                meta["members"] = members
+                added.append(key)
+        return added
+
     async def _push_to_user(self, user_id: str, user_data: dict, message: str):
         """按各平台能力推送私聊消息；不支持时静默降级（结果已落库）"""
         umo_map = dict(user_data.get("umo_by_platform") or {})
@@ -504,7 +527,6 @@ class SklandPlugin(Star):
         """把私聊的落库结果转成卡片行数据"""
         last_sign = user_data.get("last_sign") or {}
         names = user_data.get("game_names") or {}
-        awards_map = user_data.get("game_awards") or {}
         fallback = self._display_name(user_data.get("nickname", ""), user_data)
 
         ak_signed = bool(last_sign.get("arknights"))
@@ -512,33 +534,12 @@ class SklandPlugin(Star):
         ak_name = names.get("arknights") or (fallback if ak_signed else "")
         ef_name = names.get("endfield") or (fallback if ef_signed else "")
 
-        # 奖励按游戏归属，优先用结构化的 game_awards，
-        # 旧数据没有该字段时回退解析落库文本
-        awards_map = dict(awards_map)
-        if "arknights" not in awards_map or "endfield" not in awards_map:
-            text = (user_data.get("last_result") or {}).get("text") or ""
-            for line in text.split("\n"):
-                line = line.strip()
-                if "已签到 (" not in line or not line.endswith(")"):
-                    continue
-                inner = line[line.index("(") + 1:-1]
-                if not inner or inner == "无奖励":
-                    continue
-                items = [a.strip() for a in inner.split(",")]
-                if line.startswith("明日方舟"):
-                    awards_map.setdefault("arknights", items)
-                elif line.startswith("终末地"):
-                    awards_map.setdefault("endfield", items)
-
         return [{
             "name": ak_name or ef_name or fallback,
             "ak_name": ak_name,
             "ef_name": ef_name,
             "arknights": ak_signed,
             "endfield": ef_signed,
-            "ak_awards": awards_map.get("arknights") or [],
-            "ef_awards": awards_map.get("endfield") or [],
-            "awards": awards_map.get("arknights") or [],
         }]
 
     def _render_stored_result(self, user_data: dict) -> str:
@@ -556,8 +557,7 @@ class SklandPlugin(Star):
         except (TypeError, ValueError):
             stamp = ""
 
-        # 落库文本形如「明日方舟 已签到 (奖励)」，这里按游戏拆出各自昵称与奖励
-        awards_map = user_data.get("game_awards") or {}
+        # 落库文本形如「明日方舟 已签到 (奖励)」，这里按游戏拆出各自昵称与状态
         entries = []
         for line in text.split("\n"):
             line = line.strip()
@@ -569,22 +569,19 @@ class SklandPlugin(Star):
             if game is None:
                 continue
             key = "arknights" if game == "明日方舟" else "endfield"
-            # 详情去掉开头重复的游戏名，只留状态与奖励
+            # 详情去掉开头重复的游戏名，只留状态
             detail = line[len(game):].strip()
+            # 去掉奖励括号，只保留「已签到」状态
+            if "已签到 (" in detail and detail.endswith(")"):
+                detail = detail[:detail.index("(")].strip()
             name = names.get(key) or fallback
-            # 奖励优先用结构化数据，旧数据回退从详情里解析
-            items = awards_map.get(key)
-            if items is None and "已签到 (" in detail and detail.endswith(")"):
-                inner = detail[detail.index("(") + 1:-1]
-                if inner and inner != "无奖励":
-                    items = [a.strip() for a in inner.split(",")]
-            entries.append((game, key, name, items or []))
+            entries.append((game, key, name, detail))
 
         lines = ["📋 森空岛签到", ""]
-        for game, key, name, items in entries:
+        for game, key, name, detail in entries:
             lines.append(f"  {game}　{name}")
-            if items:
-                lines.append(f"    {'  '.join(items)}")
+            if detail:
+                lines.append(f"    {detail}")
         if stamp:
             lines.append("")
             lines.append(f"  {stamp}")
@@ -741,7 +738,6 @@ class SklandPlugin(Star):
             test_rows = [{
                 "name": "测试", "ak_name": "测试", "ef_name": "",
                 "arknights": True, "endfield": False,
-                "ak_awards": ["示例"], "ef_awards": [],
             }]
             try:
                 path = self._render_card(test_rows)
@@ -826,13 +822,25 @@ class SklandPlugin(Star):
             users[user_id] = user_data
             await self.put_kv_data("users", users)
 
+            # 登录是全局行为：同步到所有已知群，保证各群名单一致
+            groups = await self.get_kv_data("groups", {})
+            added_groups = self._sync_user_to_groups(groups, user_id)
+            if added_groups:
+                await self.put_kv_data("groups", groups)
+                logger.info(
+                    f"用户 {user_id} 已加入 {len(added_groups)} 个群：{added_groups}"
+                )
+
             # 群聊场景：立即撤回含 token 的那条消息，避免被他人看到
             recall_note = ""
             if is_group:
-                recalled = await self._recall_message(event)
-                recall_note = "\n\n🔒 已尝试撤回你发送的 token 消息" + (
-                    "" if recalled else "（撤回失败，请手动删除该条消息）"
-                )
+                recalled, reason = await self._recall_message(event)
+                if recalled:
+                    recall_note = "\n\n🔒 已撤回你发送的 token 消息"
+                else:
+                    recall_note = (
+                        f"\n\n⚠️ 撤回失败{reason}，请手动删除你发送的那条消息"
+                    )
 
             notice = "" if self._can_push(platform) else \
                 "\n\n（当前平台不支持主动推送，将在你查询时展示结果）"
@@ -843,41 +851,66 @@ class SklandPlugin(Star):
             if is_group:
                 await self._recall_message(event)
             yield event.plain_result(f"登录失败: {e}")
+    # 官方错误码 → 用户可读提示
+    _RECALL_ERROR_HINTS = {
+        "40062003": "机器人不是群管理员，无权撤回他人消息",
+        "40064004": "消息发送已超过 2 分钟，官方接口不允许撤回",
+        "40061001": "请求参数无效",
+        "50065001": "撤回失败，请稍后重试",
+    }
 
-    async def _recall_message(self, event: AstrMessageEvent) -> bool:
+    async def _recall_message(self, event: AstrMessageEvent) -> tuple[bool, str]:
         """
         撤回用户在群里发出的那条消息（用于保护 token）。
 
-        走 QQ 官方机器人的 DELETE /v2/groups/{group_openid}/messages/{message_id}，
-        需要机器人在群里是管理员，且消息发送未超过 2 分钟。
-        其他平台没有此能力，返回 False。
+        对应官方接口 DELETE /v2/groups/{group_openid}/messages/{message_id}：
+        - group_openid：event.message_obj.group_id 在官方适配器里就是
+          message.group_openid（见 qqofficial_platform_adapter.py `abm.group_id = message.group_openid`）
+        - message_id：event.message_obj.message_id 取自消息事件的 d.id，
+          正是文档所说「群成员的消息ID从群消息事件里获取」
+
+        官方限制：
+        - 机器人须为**群管理员**，否则报 40062003 无操作权限
+          （普通成员只能撤回机器人自己发的消息）
+        - 消息发送超过 **2 分钟**不可撤回，报 40064004
+        - 频率限制 10 QPS
+
+        返回 (是否成功, 失败原因提示)。其他平台无此能力。
         """
         bot = getattr(event, "bot", None)
         if bot is None:
-            return False
+            return False, "当前平台不支持撤回消息"
         message_id = getattr(event.message_obj, "message_id", None)
-        group_id = getattr(event.message_obj, "group_id", None)
-        if not message_id or not group_id:
-            return False
+        group_openid = getattr(event.message_obj, "group_id", None)
+        if not message_id or not group_openid:
+            return False, "未取到消息 ID 或群 ID"
 
         try:
             from botpy.http import Route
 
+            # 路径用占位符，实际值通过 kwargs 传入（与官方适配器写法一致）
             route = Route(
                 "DELETE",
-                f"/v2/groups/{group_id}/messages/{message_id}",
-                group_openid=group_id,
+                "/v2/groups/{group_openid}/messages/{message_id}",
+                group_openid=group_openid,
                 message_id=message_id,
             )
             await bot.api._http.request(route)
-            logger.info(f"[森空岛] 已撤回群 {group_id} 中的 token 消息")
-            return True
+            logger.info(f"[森空岛] 已撤回群 {group_openid} 中的 token 消息")
+            return True, ""
         except Exception as e:
+            text = str(e)
+            hint = ""
+            for code, desc in self._RECALL_ERROR_HINTS.items():
+                if code in text:
+                    hint = desc
+                    break
+            reason = f"（{hint}）" if hint else ""
             logger.warning(
-                f"[森空岛] 撤回群消息失败（群 {group_id} 消息 {message_id}）：{e}。"
-                "请手动删除该条消息，或确认机器人是否为群管理员"
+                f"[森空岛] 撤回群消息失败（群 {group_openid} 消息 {message_id}）：{e}{reason}。"
+                "请手动删除该条消息"
             )
-            return False
+            return False, reason
 
     @filter.command("skdlogout")
     async def skdlogout(self, event: AstrMessageEvent):
@@ -1013,10 +1046,15 @@ class SklandPlugin(Star):
         today = datetime.now().strftime("%Y-%m-%d")
 
         # 先收集数据，再统一渲染，保证昵称列对齐
+        #
+        # 签到名单取「所有已绑定用户」，而不是本群 members：
+        # members 只记录「在本群发过 /skd 的人」，用它会导致
+        #   - 登录后不主动发 skd 的人不出现
+        #   - 不同群看到的名单不一致
+        # 森空岛签到状态与群无关，统一按已绑定用户展示更符合预期。
         rows = []
-        for uid in members:
-            user_data = users_data.get(uid)
-            if not user_data:
+        for uid, user_data in users_data.items():
+            if not user_data or not user_data.get("token"):
                 continue
             nickname = user_data.get("nickname", "")
             failed = False
@@ -1036,7 +1074,6 @@ class SklandPlugin(Star):
 
             last_sign = user_data.get("last_sign") or {}
             names = user_data.get("game_names") or {}
-            awards_map = user_data.get("game_awards") or {}
             fallback = self._display_name(nickname, user_data)
             ak_signed = bool(last_sign.get("arknights"))
             ef_signed = bool(last_sign.get("endfield"))
@@ -1049,8 +1086,6 @@ class SklandPlugin(Star):
                 "ef_name": ef_name,
                 "arknights": ak_signed,
                 "endfield": ef_signed,
-                "ak_awards": awards_map.get("arknights") or [],
-                "ef_awards": awards_map.get("endfield") or [],
                 "failed": failed,
             })
 
