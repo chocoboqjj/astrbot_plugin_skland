@@ -4,10 +4,12 @@ AstrBot Plugin - 森空岛签到 (Skland Sign-In)
 Commands:
 - skd (group): Show sign-in status for all bound users in the group
 - skd (private): Show user's own sign-in status
-- skdlogin (private): Login with token and immediately sign in
-- skdlogout (private): Logout and remove token
+- skdlogin (all): Login with token and immediately sign in
+    群聊使用时会自动撤回含 token 的那条消息
+- skdlogout (all): Logout and remove token
 - skdusers (all): Show users and stats
 - skdhelp (all): Show help
+- skdcheck (all): Diagnose sign-in card image availability
 
 平台适配:
     同时适配 OneBot(aiocqhttp) 与 QQ 官方机器人(qq_official)。
@@ -605,6 +607,10 @@ class SklandPlugin(Star):
         "签到统计": "skdusers",
         "skdcheck": "skdcheck",
         "卡片诊断": "skdcheck",
+        "skdlogout": "skdlogout",
+        "登出": "skdlogout",
+        "skdlogin": "skdlogin",
+        "登录": "skdlogin",
     }
 
     # QQ 官方平台在消息文本里插入的 @ 标记（如 <qqbot-at-user id="xxx" />）
@@ -664,6 +670,8 @@ class SklandPlugin(Star):
         if not target:
             return
 
+        arg = parts[1] if len(parts) == 2 else ""
+
         if target == "skd":
             async for res in self.skd(event):
                 yield res
@@ -676,17 +684,24 @@ class SklandPlugin(Star):
         elif target == "skdcheck":
             async for res in self.skdcheck(event):
                 yield res
+        elif target == "skdlogout":
+            async for res in self.skdlogout(event):
+                yield res
+        elif target == "skdlogin":
+            async for res in self.skdlogin(event, arg):
+                yield res
 
     @filter.command("skdhelp")
     async def skdhelp(self, event: AstrMessageEvent):
         """森空岛签到插件帮助"""
         yield event.plain_result(
             "森空岛签到插件帮助\n"
-            "1. 私聊机器人发送 /skdlogin <token> 登录并签到\n"
-            "2. 私聊机器人发送 /skdlogout 登出\n"
+            "1. 发送 /skdlogin <token> 登录并签到\n"
+            "2. 发送 /skdlogout 登出\n"
             "3. /skd 查看签到状态\n"
             "4. /skdusers 查看绑定统计\n"
-            "5. /skdcheck 查看签到卡片图片的可用状态"
+            "5. /skdcheck 查看签到卡片图片的可用状态\n"
+            "注：token 等同账号密码，群聊中发送后插件会自动撤回该条消息"
         )
 
     @filter.command("skdcheck")
@@ -742,12 +757,17 @@ class SklandPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.command("skdlogin")
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def skdlogin(self, event: AstrMessageEvent, token: str = ""):
-        """使用 token 登录并立即签到"""
+        """
+        使用 token 登录并立即签到。
+
+        私聊与群聊都支持。群聊场景下会立即撤回用户发出的那条消息，
+        避免 token 被他人看到（撤回需机器人是群管理员且在 2 分钟内）。
+        """
         config = self._get_config()
         platform = self._detect_platform(event)
         user_name = event.get_sender_name()
+        is_group = self._is_group(event)
 
         users = await self.get_kv_data("users", {})
         user_id = self._resolve_user_key(users, event.get_sender_id())
@@ -761,7 +781,9 @@ class SklandPlugin(Star):
                 "   打开 (https://web-api.skland.com/account/info/hg) 记下 content 字段的值。\n"
                 "   content字段示例：N6QKb2C3d4A1b2C3d4，如果其中包含符号也一起复制\n"
                 "2. 使用方法: /skdlogin <content>\n"
-                "   注意：token 等同账号密码，只在私聊中提交"
+                "   注意：token 等同账号密码，"
+                + ("群聊中发送后请立即撤回该条消息\n" if is_group
+                   else "建议只在私聊中提交\n")
             )
             return
 
@@ -804,15 +826,60 @@ class SklandPlugin(Star):
             users[user_id] = user_data
             await self.put_kv_data("users", users)
 
+            # 群聊场景：立即撤回含 token 的那条消息，避免被他人看到
+            recall_note = ""
+            if is_group:
+                recalled = await self._recall_message(event)
+                recall_note = "\n\n🔒 已尝试撤回你发送的 token 消息" + (
+                    "" if recalled else "（撤回失败，请手动删除该条消息）"
+                )
+
             notice = "" if self._can_push(platform) else \
                 "\n\n（当前平台不支持主动推送，将在你查询时展示结果）"
-            yield event.plain_result(f"登录成功！\n{body}{notice}")
+            yield event.plain_result(f"登录成功！\n{body}{notice}{recall_note}")
         except Exception as e:
             logger.error(f"skdlogin失败: {e}")
+            # 失败时也要撤回，防止 token 留在群里
+            if is_group:
+                await self._recall_message(event)
             yield event.plain_result(f"登录失败: {e}")
 
+    async def _recall_message(self, event: AstrMessageEvent) -> bool:
+        """
+        撤回用户在群里发出的那条消息（用于保护 token）。
+
+        走 QQ 官方机器人的 DELETE /v2/groups/{group_openid}/messages/{message_id}，
+        需要机器人在群里是管理员，且消息发送未超过 2 分钟。
+        其他平台没有此能力，返回 False。
+        """
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return False
+        message_id = getattr(event.message_obj, "message_id", None)
+        group_id = getattr(event.message_obj, "group_id", None)
+        if not message_id or not group_id:
+            return False
+
+        try:
+            from botpy.http import Route
+
+            route = Route(
+                "DELETE",
+                f"/v2/groups/{group_id}/messages/{message_id}",
+                group_openid=group_id,
+                message_id=message_id,
+            )
+            await bot.api._http.request(route)
+            logger.info(f"[森空岛] 已撤回群 {group_id} 中的 token 消息")
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[森空岛] 撤回群消息失败（群 {group_id} 消息 {message_id}）：{e}。"
+                "请手动删除该条消息，或确认机器人是否为群管理员"
+            )
+            return False
+
     @filter.command("skdlogout")
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def skdlogout(self, event: AstrMessageEvent):
         """登出并清除绑定信息"""
         users = await self.get_kv_data("users", {})
