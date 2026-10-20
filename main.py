@@ -48,6 +48,8 @@ PLATFORM_QQOFFICIAL = "qq_official"
 PLATFORM_OTHER = "other"
 
 # 各平台主动推送能力（由平台规则决定，详见 README）
+# need_at_in_group 记录该平台群聊是否需要 @ 才能触发指令，作为平台差异的
+# 事实描述保留；指令提示文案统一不在输出中展示该差异。
 PLATFORM_CAPABILITY = {
     PLATFORM_ONEBOT: {
         "can_push_private": True,   # 支持定时私聊推送
@@ -57,7 +59,7 @@ PLATFORM_CAPABILITY = {
     PLATFORM_QQOFFICIAL: {
         "can_push_private": False,  # 官方已取消主动推送
         "can_push_group": True,     # 群主开启开关后有限频能力
-        "need_at_in_group": True,   # 群聊必须 @ 机器人
+        "need_at_in_group": True,   # 群聊需 @ 机器人
     },
     PLATFORM_OTHER: {
         "can_push_private": False,
@@ -394,6 +396,31 @@ class SklandPlugin(Star):
 
     # ==================== Helpers ====================
 
+    @staticmethod
+    def _display_width(text: str) -> int:
+        """按显示宽度计算字符串长度：中文/全角字符占 2 列"""
+        return sum(2 if ord(c) > 0x2E80 else 1 for c in text)
+
+    @classmethod
+    def _pad(cls, text: str, width: int) -> str:
+        """按显示宽度右侧补空格，保证列对齐"""
+        return text + " " * max(0, width - cls._display_width(text))
+
+    @classmethod
+    def _truncate(cls, text: str, width: int) -> str:
+        """按显示宽度截断，超长部分以省略号结尾"""
+        if cls._display_width(text) <= width:
+            return text
+        out = ""
+        used = 0
+        for ch in text:
+            w = 2 if ord(ch) > 0x2E80 else 1
+            if used + w > width - 1:
+                break
+            out += ch
+            used += w
+        return out + "…"
+
     def _is_signed_today(self, result) -> bool:
         return self._is_signed_today_static(result)
 
@@ -423,30 +450,115 @@ class SklandPlugin(Star):
         last = user_data.get("last_result") or {}
         text = last.get("text")
         name = self._display_name(user_data.get("nickname", ""), user_data)
-        header = f"森空岛签到状态【{name}】"
         if not text:
-            return f"{header}\n\n暂无签到记录，发送 /skdlogin <token> 开始绑定"
+            return "📋 森空岛签到\n\n暂无签到记录，发送 /skdlogin <token> 开始绑定"
+
         stamp = last.get("time") or ""
         try:
             stamp = datetime.fromisoformat(stamp).strftime("%Y-%m-%d %H:%M")
         except (TypeError, ValueError):
-            pass
-        return f"{header}\n\n{text}\n\n签到时间: {stamp}" if stamp else f"{header}\n\n{text}"
+            stamp = ""
+
+        lines = ["📋 森空岛签到", "", f"  {name}"]
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # 落库文本首行形如「【昵称】」，这里已单独展示昵称，跳过
+            if line.startswith("【") and line.endswith("】"):
+                continue
+            lines.append(f"    {line}")
+        if stamp:
+            lines.append("")
+            lines.append(f"  {stamp}")
+        return "\n".join(lines)
 
     # ==================== Commands ====================
+
+    # 裸指令别名：QQ 官方群里 @机器人 skd（不带 /）不会命中 CommandFilter。
+    # 原因：适配器已剥离 At 标记，message_str 变成 "skd"；但它不以 wake_prefix
+    # 开头，唤醒检查走 At 分支时会把 message_str 置空，CommandFilter 又要求
+    # 剥前缀后全等匹配指令名，因此匹配失败。这里改从消息链的 Plain 段取原文。
+    BARE_COMMANDS = {
+        "skd": "skd",
+        "签到": "skd",
+        "森空岛签到": "skd",
+        "森空岛": "skd",
+        "skdhelp": "skdhelp",
+        "帮助": "skdhelp",
+        "skdusers": "skdusers",
+        "签到统计": "skdusers",
+    }
+
+    @staticmethod
+    def _raw_text(event: AstrMessageEvent) -> str:
+        """
+        取消息的原始纯文本。
+
+        不能用 get_message_str()：唤醒检查阶段已对它做过处理，
+        走 At 唤醒分支时会被置空，裸指令文本会丢失。
+        """
+        parts = []
+        for seg in event.get_messages() or []:
+            if type(seg).__name__ == "Plain":
+                parts.append(getattr(seg, "text", "") or "")
+        text = "".join(parts).strip()
+        if text:
+            return text
+        return (event.get_message_str() or "").strip()
+
+    @staticmethod
+    def _is_at_bot(event: AstrMessageEvent) -> bool:
+        """判断消息链中是否 @ 了机器人"""
+        try:
+            self_id = str(event.get_self_id())
+        except Exception:
+            self_id = ""
+        for seg in event.get_messages() or []:
+            if type(seg).__name__ == "At":
+                at_id = str(getattr(seg, "qq", "") or "")
+                if not self_id or at_id == self_id or at_id == "all":
+                    return True
+        return False
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=99)
+    async def bare_command_listener(self, event: AstrMessageEvent):
+        """兜底处理 @机器人 skd 这类不带 wake_prefix 的写法"""
+        message = self._raw_text(event)
+        if not message:
+            return
+
+        # 群聊必须真的 @ 了机器人才处理，避免抢答普通群聊
+        if self._is_group(event) and not self._is_at_bot(event):
+            return
+
+        parts = message.split()
+        if len(parts) > 2:
+            return
+        head = parts[0].lower() if parts else ""
+        target = self.BARE_COMMANDS.get(head)
+        if not target:
+            return
+
+        if target == "skd":
+            async for res in self.skd(event):
+                yield res
+        elif target == "skdhelp":
+            async for res in self.skdhelp(event):
+                yield res
+        elif target == "skdusers":
+            async for res in self.skdusers(event):
+                yield res
 
     @filter.command("skdhelp")
     async def skdhelp(self, event: AstrMessageEvent):
         """森空岛签到插件帮助"""
-        platform = self._detect_platform(event)
-        tip = "\n（QQ 官方机器人：群聊内需 @机器人 才能触发指令）" \
-            if self._capability(platform).get("need_at_in_group") else ""
         yield event.plain_result(
             "森空岛签到插件帮助\n"
             "1. 私聊机器人发送 /skdlogin <token> 登录并签到\n"
             "2. 私聊机器人发送 /skdlogout 登出\n"
-            "3. /skd 查看签到状态（群聊需 @机器人）\n"
-            "4. /skdusers 查看绑定统计" + tip
+            "3. /skd 查看签到状态\n"
+            "4. /skdusers 查看绑定统计"
         )
 
     @filter.command("skdlogin")
@@ -641,13 +753,15 @@ class SklandPlugin(Star):
 
         live = config.get("live_query_in_group", False)
         today = datetime.now().strftime("%Y-%m-%d")
-        lines = [" 森空岛签到统计", "═══════════════", "方舟 | 终末 | 昵称", "-----------------"]
 
+        # 先收集数据，再统一渲染，保证昵称列对齐
+        rows = []
         for uid in members:
             user_data = users_data.get(uid)
             if not user_data:
                 continue
             nickname = user_data.get("nickname", "")
+            failed = False
             if live:
                 try:
                     results, live_nick = await self.api.do_full_sign_in(user_data["token"])
@@ -658,18 +772,61 @@ class SklandPlugin(Star):
                     users_data[uid] = user_data
                 except Exception as e:
                     logger.warning(f"群聊实时查询用户 {uid} 失败: {e}")
-                    lines.append(" ⚠️ | ⚠️ | (查询失败)")
-                    continue
+                    failed = True
 
             last_sign = user_data.get("last_sign") or {}
-            ak = "✅" if last_sign.get("arknights") else "❌"
-            ef = "✅" if last_sign.get("endfield") else "❌"
-            lines.append(f" {ak} | {ef} | {self._display_name(nickname, user_data)}")
+            rows.append({
+                "name": self._display_name(nickname, user_data),
+                "arknights": bool(last_sign.get("arknights")),
+                "endfield": bool(last_sign.get("endfield")),
+                "failed": failed,
+            })
 
         await self.put_kv_data("groups", groups)
         await self.put_kv_data("users", users_data)
 
-        if self._capability(platform).get("need_at_in_group"):
-            lines.append("\n(QQ 官方机器人：需 @机器人 + 指令，且默认收不到全量群消息)")
-        lines.append("（状态来自最近一次自动签到，发送 /skdlogin 可刷新）")
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(self._render_group_status(rows))
+
+    # 群聊状态表的列宽（按显示宽度，中文占 2 列）
+    _GAME_COL = 10
+    _NAME_MAX = 20
+
+    def _render_group_status(self, rows: list) -> str:
+        """
+        渲染群聊签到状态表：状态列在前、昵称在后。
+
+        昵称放在最后的好处是状态列宽度固定，昵称长短不影响对齐；
+        同时昵称超长只会在行尾溢出，不会挤动前面的列。
+        """
+        if not rows:
+            return "📋 森空岛签到\n\n本群还没有人绑定账号"
+
+        lines = ["📋 森空岛签到"]
+
+        signed_count = 0
+        ak_count = 0
+        ef_count = 0
+        for r in rows:
+            name = self._truncate(r["name"], self._NAME_MAX)
+            if r.get("failed"):
+                lines.append(f"  ⚠️ 查询失败{' ' * 2}·  {name}")
+                continue
+            ak = "✓" if r["arknights"] else "✗"
+            ef = "✓" if r["endfield"] else "✗"
+            if r["arknights"]:
+                ak_count += 1
+            if r["endfield"]:
+                ef_count += 1
+            if r["arknights"] or r["endfield"]:
+                signed_count += 1
+            lines.append(
+                f"  {ak} {self._pad('明日方舟', self._GAME_COL)}"
+                f" {ef} {self._pad('终末地', self._GAME_COL)}"
+                f"   {name}"
+            )
+
+        total = len(rows)
+        lines.append("")
+        lines.append(f"  已签到 {signed_count}/{total} 人"
+                     f"　·　明日方舟 {ak_count}　·　终末地 {ef_count}")
+        return "\n".join(lines)
