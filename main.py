@@ -21,14 +21,19 @@ Commands:
 
 Config (AstrBot plugin config):
 - auto_sign_enabled: 自动签到开关
-- auto_sign_hour: 自动签到时间（小时，0-23），默认 0
+- auto_sign_hour: 自动签到时间（小时，0-23），默认 8
 - auto_sign_minute: 自动签到时间（分钟，0-59），默认 30
+- push_enabled: 每日签到结果推送开关
+- push_hour: 签到结果推送时间（小时，0-23），默认 9
+- push_minute: 签到结果推送时间（分钟，0-59），默认 0
 - show_player_name: 显示玩家昵称（否则显示平台昵称）
 - auto_sign_delay: 签到延时
 - max_users: 最大用户数量
 - push_mode: 推送模式（auto/private/pull）
 - group_broadcast_enabled: 自动签到后向群播报汇总
 - live_query_in_group: 群聊 /skd 是否实时查询
+- card_image_enabled: /skd 是否以图片卡片输出
+- push_card_image: 每日签到推送与新人登录后是否以图片卡片输出
 """
 
 import asyncio
@@ -77,7 +82,7 @@ PLATFORM_CAPABILITY = {
 }
 
 
-@register(PLUGIN_NAME, "AstrBot", "森空岛自动签到插件（支持 OneBot 与 QQ 官方机器人）", "1.5.0")
+@register(PLUGIN_NAME, "AstrBot", "森空岛自动签到插件（支持 OneBot 与 QQ 官方机器人）", "1.7.0")
 class SklandPlugin(Star):
     """森空岛签到插件"""
 
@@ -97,10 +102,16 @@ class SklandPlugin(Star):
         defaults = [
             ("自动签到开关", "auto_sign_enabled", True,
              "开启后，将在指定时间自动为所有已注册用户签到"),
-            ("自动签到时间（小时）", "auto_sign_hour", 0,
-             "自动签到执行的小时（0-23）。签到状态每日 0 点重置，实际签到安排在此后的时间"),
+            ("自动签到时间（小时）", "auto_sign_hour", 8,
+             "自动签到执行的小时（0-23），默认 8 即早上 8:30 执行签到（只落库，不推送）"),
             ("自动签到时间（分钟）", "auto_sign_minute", 30,
-             "自动签到执行的分钟（0-59），默认 30 即 0:30 执行"),
+             "自动签到执行的分钟（0-59），默认 30 即 8:30 执行"),
+            ("签到结果推送时间（小时）", "push_hour", 9,
+             "每日签到结果推送的小时（0-23），默认 9。独立于签到时间，读取已落库结果后推送"),
+            ("签到结果推送时间（分钟）", "push_minute", 0,
+             "每日签到结果推送的分钟（0-59），默认 0 即 9:00 推送"),
+            ("签到结果推送开关", "push_enabled", True,
+             "关闭后只做签到落库，不主动推送签到结果（用户仍可用 /skd 主动查询）"),
             ("显示玩家名称", "show_player_name", True,
              "开启后显示森空岛昵称，否则显示平台昵称"),
             ("自动签到的延迟", "auto_sign_delay", 10,
@@ -115,6 +126,9 @@ class SklandPlugin(Star):
              "开启后群聊 /skd 实时请求森空岛，人数多时较慢且请求量大"),
             ("签到卡片图片", "card_image_enabled", False,
              "开启后 /skd 以图片卡片输出签到状态；缺少 Pillow 或中文字体时自动回退为文本"),
+            ("签到结果图片推送", "push_card_image", True,
+             "每日签到结果推送与新用户登录成功后，以图片卡片输出（与 /skd 同款）；"
+             "缺少 Pillow 或中文字体时自动回退为纯文本"),
             ("卡片主题", "card_theme", "dark",
              "dark=深色 / light=浅色，仅在启用图片卡片时生效"),
             ("token 冲突处理", "token_conflict", "reject",
@@ -135,8 +149,11 @@ class SklandPlugin(Star):
         """获取当前配置"""
         return {
             "auto_sign_enabled": self.config.get("auto_sign_enabled", True),
-            "auto_sign_hour": self.config.get("auto_sign_hour", 0),
+            "auto_sign_hour": self.config.get("auto_sign_hour", 8),
             "auto_sign_minute": self.config.get("auto_sign_minute", 30),
+            "push_hour": self.config.get("push_hour", 9),
+            "push_minute": self.config.get("push_minute", 0),
+            "push_enabled": self.config.get("push_enabled", True),
             "show_player_name": self.config.get("show_player_name", True),
             "auto_sign_delay": self.config.get("auto_sign_delay", 10),
             "max_users": self.config.get("max_users", 10),
@@ -144,6 +161,7 @@ class SklandPlugin(Star):
             "group_broadcast_enabled": self.config.get("group_broadcast_enabled", False),
             "live_query_in_group": self.config.get("live_query_in_group", False),
             "card_image_enabled": self.config.get("card_image_enabled", False),
+            "push_card_image": self.config.get("push_card_image", True),
             "card_theme": self.config.get("card_theme", "dark"),
             "token_conflict": self.config.get("token_conflict", "reject"),
         }
@@ -536,14 +554,70 @@ class SklandPlugin(Star):
         """插件初始化"""
         logger.info("森空岛签到插件已加载")
         await self._migrate_storage()
+        await self._migrate_sign_time()
         config = self._get_config()
         if config.get("auto_sign_enabled", False):
             self._start_auto_sign_job(
-                config.get("auto_sign_hour", 0),
+                config.get("auto_sign_hour", 8),
                 config.get("auto_sign_minute", 30),
             )
+            if config.get("push_enabled", True):
+                self._start_auto_push_job(
+                    config.get("push_hour", 9),
+                    config.get("push_minute", 0),
+                )
         if not self.scheduler.running:
             self.scheduler.start()
+
+    async def _migrate_sign_time(self):
+        """
+        把签到时间迁移到「签到与推送分离」的新默认值。
+
+        AstrBot 的配置文件是「首次写入后不再回填默认值」的：老实例里
+        auto_sign_hour/minute 仍然是 0/30 或上一版的 9/00，只改 schema 不会生效。
+        这里只在检测到**恰好是历史默认值**时改写，不动用户自己设置过的时间。
+
+        用一次性标记位收口：迁移完成后写入 _sign_split_migrated，
+        之后用户把签到时间手动调成 9:00 也不会再被改回去。
+        """
+        try:
+            if self.config.get("_sign_split_migrated", False):
+                return
+
+            hour = self.config.get("auto_sign_hour", 8)
+            minute = self.config.get("auto_sign_minute", 30)
+            changed = False
+
+            # 历史默认值：最早的 0:30，以及 1.6.0 的 9:00（签到推送合一）
+            if (hour, minute) in ((0, 30), (9, 0)):
+                self.config["auto_sign_hour"] = 8
+                self.config["auto_sign_minute"] = 30
+                changed = True
+                logger.info(
+                    "森空岛：签到时间已从 "
+                    f"{hour:02d}:{minute:02d} 迁移到 08:30（推送独立为 09:00）"
+                )
+
+            # 补齐新增的推送时间配置，老实例没有这两个键
+            if "push_hour" not in self.config:
+                self.config["push_hour"] = 9
+                changed = True
+            if "push_minute" not in self.config:
+                self.config["push_minute"] = 0
+                changed = True
+            if "push_enabled" not in self.config:
+                self.config["push_enabled"] = True
+                changed = True
+
+            self.config["_sign_split_migrated"] = True
+            changed = True
+
+            if changed:
+                saver = getattr(self.config, "save_config", None)
+                if callable(saver):
+                    saver()
+        except Exception as e:
+            logger.warning(f"森空岛：迁移签到时间失败（不影响启动）: {e}")
 
     async def terminate(self):
         """插件卸载"""
@@ -554,12 +628,13 @@ class SklandPlugin(Star):
 
     # ==================== Auto Sign-In ====================
 
-    def _start_auto_sign_job(self, hour: int = 0, minute: int = 30):
+    def _start_auto_sign_job(self, hour: int = 8, minute: int = 30):
         """
-        启动自动签到定时任务。
+        启动自动签到定时任务（只签到、只落库，不推送）。
 
         签到状态在每日 0 点随日期自然重置（last_sign 存的是日期），
-        实际签到安排在 0 点之后（默认 0:30），避开整点的接口高峰。
+        实际签到安排在 0 点之后（默认 8:30），避开整点的接口高峰。
+        推送由独立的 _start_auto_push_job 负责，两个时间互不影响。
         """
         hour = max(0, min(23, int(hour)))
         minute = max(0, min(59, int(minute)))
@@ -575,7 +650,31 @@ class SklandPlugin(Star):
             id="skland_auto_sign",
             misfire_grace_time=3600,
         )
-        logger.info(f"森空岛自动签到任务已启动，每天 {hour:02d}:{minute:02d} 执行")
+        logger.info(f"森空岛自动签到任务已启动，每天 {hour:02d}:{minute:02d} 执行（仅落库）")
+
+    def _start_auto_push_job(self, hour: int = 9, minute: int = 0):
+        """
+        启动每日签到结果推送定时任务。
+
+        与签到任务完全解耦：到点后读取库里已落库的签到结果，
+        按 /skd 同款卡片推送给用户。因此推送时间可以晚于签到时间，
+        也可以配成与签到同一时刻（此时两者仍各自独立触发）。
+        """
+        hour = max(0, min(23, int(hour)))
+        minute = max(0, min(59, int(minute)))
+        trigger = CronTrigger(hour=hour, minute=minute)
+        try:
+            self.scheduler.remove_job("skland_auto_push")
+        except Exception:
+            pass
+
+        self.scheduler.add_job(
+            self._push_daily_results,
+            trigger=trigger,
+            id="skland_auto_push",
+            misfire_grace_time=3600,
+        )
+        logger.info(f"森空岛签到结果推送任务已启动，每天 {hour:02d}:{minute:02d} 推送")
 
     @staticmethod
     def _mark_signed(user_data: dict, results: list, today: str) -> None:
@@ -653,7 +752,12 @@ class SklandPlugin(Star):
         return any(v == today for v in last_sign.values())
 
     async def _auto_sign_all_users(self):
-        """为所有已注册用户执行自动签到，结果落库，按平台能力决定是否推送"""
+        """
+        为所有已注册用户执行自动签到，结果落库。
+
+        这一步**不做任何推送**：推送由独立的 _push_daily_results 在
+        另一个时间点读取落库结果后发出，两者时间互不影响。
+        """
         config = self._get_config()
         if not config.get("auto_sign_enabled", False):
             logger.info("自动签到已关闭，跳过执行")
@@ -669,7 +773,6 @@ class SklandPlugin(Star):
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
         stamp = now.isoformat(timespec="seconds")
-        broadcast_groups: dict[str, list[str]] = {}
 
         for user_id, user_data in users.items():
             if max_delay > 0:
@@ -682,7 +785,6 @@ class SklandPlugin(Star):
                 continue
 
             all_bodies = []
-            any_ok = False
             failed_accounts = []
 
             for account in accounts:
@@ -696,6 +798,10 @@ class SklandPlugin(Star):
                         f"今日已签到，跳过"
                     )
                     continue
+                # 先给个兜底昵称：请求失败时 nickname 还没赋值，
+                # 直接在 except 里引用会抛 UnboundLocalError，
+                # 连带整个自动签到任务崩溃
+                nickname = ""
                 try:
                     results, nickname = await self.api.do_full_sign_in(token)
                     self._mark_signed(account, results, today)
@@ -704,9 +810,8 @@ class SklandPlugin(Star):
 
                     body = self._format_sign_status(results, nickname)
                     ok = any(self._is_signed_today(r) for r in results) if results else False
-                    any_ok = any_ok or ok
 
-                    # 结果始终落库，供拉取模型读取
+                    # 结果始终落库，供拉取模型与推送任务读取
                     account["last_result"] = {"time": stamp, "text": body, "ok": ok}
                     if nickname:
                         account["nickname"] = nickname
@@ -714,7 +819,9 @@ class SklandPlugin(Star):
                     all_bodies.append(body)
                     logger.info(f"用户 {user_id} ({nickname}) 自动签到完成")
                 except Exception as e:
-                    logger.error(f"用户 {user_id} 账号 {nickname or '?'} 签到失败: {e}")
+                    logger.error(
+                        f"用户 {user_id} 账号 {nickname or account.get('nickname') or '?'} "
+                        f"签到失败: {e}")
                     account["last_result"] = {
                         "time": stamp, "text": f"签到失败：{e}", "ok": False}
                     failed_accounts.append(f"{account.get('nickname') or '账号'}: {e}")
@@ -724,30 +831,88 @@ class SklandPlugin(Star):
 
             # 顶层镜像第一个账号（兼容旧读取路径）
             self._upsert_account(user_data, accounts[0])
+            users[user_id] = user_data
 
-            if all_bodies:
-                message = "🎮森空岛自动签到结果\n\n" + "\n\n".join(all_bodies)
-                await self._push_to_user(user_id, user_data, message)
+        await self.put_kv_data("users", users)
+        logger.info("自动签到执行完毕，结果已落库，等待推送时间点发送")
 
-            if failed_accounts:
+    async def _push_daily_results(self):
+        """
+        每日签到结果推送：读取库里已落库的签到结果，按 /skd 同款卡片推送给用户。
+
+        与签到任务是两个独立的定时任务，因此：
+        - 推送时间可以晚于签到时间（默认 8:30 签到、9:00 推送）
+        - 签到失败重试也不会影响已经排好的推送
+        - 插件在推送时点重启后仍能从库里拿到完整结果
+        """
+        config = self._get_config()
+        if not config.get("auto_sign_enabled", False):
+            logger.info("自动签到已关闭，跳过推送")
+            return
+        if not config.get("push_enabled", True):
+            logger.info("签到结果推送已关闭，跳过推送")
+            return
+
+        users = await self.get_kv_data("users", {})
+        if not users:
+            logger.info("没有已注册的用户，跳过签到结果推送")
+            return
+
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        groups = await self.get_kv_data("groups", {})
+        broadcast_groups: dict[str, list[str]] = {}
+        pushed = 0
+
+        for user_id, user_data in users.items():
+            accounts = self._get_accounts(user_data)
+            if not accounts:
+                continue
+
+            # 只认今天落库的结果：last_result.time 是 ISO 时间串，
+            # 取前 10 位比对日期，避免把昨天的结果当成今天的推出去
+            todays = [a for a in accounts
+                      if str((a.get("last_result") or {}).get("time") or "")[:10] == today]
+            if not todays:
+                continue
+
+            bodies = [str((a.get("last_result") or {}).get("text") or "")
+                      for a in todays]
+            bodies = [b for b in bodies if b]
+            failures = [b for b in bodies if b.startswith("签到失败")]
+            bodies = [b for b in bodies if not b.startswith("签到失败")]
+
+            if bodies:
+                # 优先推送与 /skd 同款的签到卡片图片，渲染不可用时回退纯文本
+                card_path = None
+                if config.get("push_card_image", True):
+                    card_path = self._render_card(
+                        self._private_card_rows(user_data, today))
+                if card_path:
+                    await self._push_to_user(
+                        user_id, user_data, "", image_path=card_path)
+                else:
+                    message = "🎮森空岛自动签到结果\n\n" + "\n\n".join(bodies)
+                    await self._push_to_user(user_id, user_data, message)
+                pushed += 1
+
+            if failures:
                 await self._push_to_user(
                     user_id, user_data,
-                    "⚠️ 自动签到失败\n错误: " + "\n".join(failed_accounts)
+                    "⚠️ 自动签到失败\n" + "\n".join(failures)
                     + "\n请使用 /skdlogin 重新登录",
                 )
 
-            display = self._display_name(user_data.get("nickname", ""), user_data)
-            if any_ok:
-                for gkey in self._find_user_groups(await self.get_kv_data("groups", {}), user_id):
+            if bodies:
+                display = self._display_name(user_data.get("nickname", ""), user_data)
+                for gkey in self._find_user_groups(groups, user_id):
                     broadcast_groups.setdefault(gkey, []).append(display)
-
-            users[user_id] = user_data
 
         await self.put_kv_data("users", users)
 
         if config.get("group_broadcast_enabled", False):
             await self._broadcast_group_summary(broadcast_groups)
-        logger.info("自动签到执行完毕")
+        logger.info(f"签到结果推送完毕，共推送 {pushed} 人")
 
     @staticmethod
     def _find_user_groups(groups: dict, user_id: str) -> list[str]:
@@ -778,8 +943,14 @@ class SklandPlugin(Star):
                 added.append(key)
         return added
 
-    async def _push_to_user(self, user_id: str, user_data: dict, message: str):
-        """按各平台能力推送私聊消息；不支持时静默降级（结果已落库）"""
+    async def _push_to_user(self, user_id: str, user_data: dict, message: str,
+                            image_path: str | None = None):
+        """
+        按各平台能力推送私聊消息；不支持时静默降级（结果已落库）。
+
+        image_path 非空时推送结果图片（与 /skd 指令同款卡片），
+        消息体只发图片，不再附带纯文本。
+        """
         umo_map = dict(user_data.get("umo_by_platform") or {})
         if not umo_map:
             legacy_umo = user_data.get("umo")
@@ -793,7 +964,11 @@ class SklandPlugin(Star):
                 logger.info(f"用户 {user_id} 在 {platform} 平台不支持主动推送，结果已落库待查询")
                 continue
             try:
-                await self.context.send_message(umo, MessageChain().message(message))
+                if image_path:
+                    chain = MessageChain().file_image(image_path)
+                else:
+                    chain = MessageChain().message(message)
+                await self.context.send_message(umo, chain)
                 user_data["notify_ok_count"] = user_data.get("notify_ok_count", 0) + 1
                 logger.info(f"已推送签到结果给用户 {user_id}（{platform}）")
             except Exception as e:
@@ -872,27 +1047,25 @@ class SklandPlugin(Star):
             return fallback
         return nickname.strip() if nickname and nickname.strip() else fallback
 
-    def _private_card_rows(self, user_data: dict) -> list:
-        """把私聊的落库结果转成卡片行数据（合并该用户的所有账号）"""
-        accounts = self._get_accounts(user_data)
-        fallback = self._display_name(user_data.get("nickname", ""), user_data)
+    def _private_card_rows(self, user_data: dict, today: str = "") -> list:
+        """
+        把私聊的落库结果转成卡片行数据（合并该用户的所有账号）。
 
-        # 同名角色合并（不同账号/服务器可能重名），避免出现重复名字
-        ak_names, ak_states, ak_awards = self._collect_game_entries(
-            accounts, "arknights", "arknights", user_data)
-        ef_names, ef_states, ef_awards = self._collect_game_entries(
-            accounts, "endfield", "endfield", user_data)
-
+        与群聊卡片共用 _build_user_row，保证同一个人
+        在 /skd 私聊、/skd 群聊、每日推送里看到的数据完全一致。
+        """
+        today = today or datetime.now().strftime("%Y-%m-%d")
+        row = self._build_user_row(user_data, today)
+        if row:
+            return [row]
+        # 没有可展示的角色名时，给一行只有名字的兜底数据
         return [{
-            "name": fallback,
-            "ak_names": ak_names,
-            "ef_names": ef_names,
-            "ak_name": "/".join(ak_names),
-            "ef_name": "/".join(ef_names),
-            "arknights": self._merge_state(ak_states),
-            "endfield": self._merge_state(ef_states),
-            "ak_awards": ak_awards,
-            "ef_awards": ef_awards,
+            "name": self._display_name(user_data.get("nickname", ""), user_data),
+            "ak_names": [], "ef_names": [],
+            "ak_name": "", "ef_name": "",
+            "arknights": "none", "endfield": "none",
+            "ak_awards": [], "ef_awards": [],
+            "failed": False,
         }]
 
     def _render_stored_result(self, user_data: dict) -> str:
@@ -1220,6 +1393,9 @@ class SklandPlugin(Star):
 
         users = await self.get_kv_data("users", {})
         user_id = self._resolve_user_key(users, event.get_sender_id())
+        # 记录该用户本次登录前是否已有绑定账号：
+        # 「新的人」= 首次绑定，而不是给已有账号补一次签到状态
+        had_account_before = bool(self._get_accounts(users.get(user_id) or {}))
 
         # 规范化 token：去掉复制粘贴可能带入的隐形字符，
         # 否则同一个 token 会被当成两个不同账号
@@ -1371,6 +1547,16 @@ class SklandPlugin(Star):
                 head = "登录成功！（已更新该账号的签到状态）"
             yield event.plain_result(
                 f"{head}\n{body}{notice}{recall_note}{merged_note}")
+
+            # 新的人登录成功后，补发一张与 /skd 同款的签到结果图片，
+            # 让用户立刻看到自己今天的签到状态与奖励
+            if not had_account_before and config.get("push_card_image", True):
+                card_path = self._render_card(
+                    self._private_card_rows(user_data, now.strftime("%Y-%m-%d")))
+                if card_path:
+                    yield event.chain_result([Comp.Image.fromFileSystem(card_path)])
+                else:
+                    logger.warning("登录成功卡片渲染不可用，已仅返回文本结果")
         except Exception as e:
             logger.error(f"skdlogin失败: {e}")
             # 失败时也要撤回，防止 token 留在群里
@@ -1560,7 +1746,7 @@ class SklandPlugin(Star):
         return "part"
 
     def _collect_game_entries(self, accounts: list, game_key: str, game_name: str,
-                              user_data: dict) -> tuple[list[str], list[bool],
+                              user_data: dict, today: str = "") -> tuple[list[str], list[bool],
                                                       list[str]]:
         """
         收集多个账号在某游戏上的角色名、签到状态与奖励。
@@ -1569,8 +1755,12 @@ class SklandPlugin(Star):
         方舟角色名可能相同（如不同服务器/渠道服上的同名角色）。
         显示时同名只出现一次，状态取「任一已签即为已签」，奖励去重合并。
 
+        today 为空时按「历史上签到过」判定；传入日期时只认当天的签到记录
+        （last_sign 存的是日期，跨天自动失效）。
+
         返回 (角色名列表, 状态列表, 奖励列表)
         """
+        today = today or datetime.now().strftime("%Y-%m-%d")
         names: list[str] = []
         states: list[bool] = []
         awards: list[str] = []
@@ -1580,7 +1770,7 @@ class SklandPlugin(Star):
             names_map = account.get("game_names") or {}
             awards_map = account.get("game_awards") or {}
             nick = self._display_name(account.get("nickname", ""), user_data)
-            signed = bool(last_sign.get(game_key))
+            signed = last_sign.get(game_key) == today
             name = names_map.get(game_name) or (nick if signed else "")
             if not name:
                 continue
@@ -1768,34 +1958,9 @@ class SklandPlugin(Star):
                     failed = not has_valid
                 users_data[uid] = user_data
 
-            # 汇总该用户所有账号在两个游戏上的昵称、签到状态与奖励
-            # 汇总该用户所有账号在两个游戏上的昵称、签到状态与奖励
-            # 同名角色会合并（不同账号/服务器可能重名），避免列表出现重复
-            ak_names, ak_states, ak_awards = self._collect_game_entries(
-                accounts, "arknights", "arknights", user_data)
-            ef_names, ef_states, ef_awards = self._collect_game_entries(
-                accounts, "endfield", "endfield", user_data)
-
-            if not ak_names and not ef_names:
-                continue
-
-            rows.append({
-                "name": self._display_name(
-                    accounts[0].get("nickname", ""), user_data),
-                # 各游戏的角色名列表：同游戏内用「/」分隔多个账号
-                "ak_names": ak_names,
-                "ef_names": ef_names,
-                # 兼容旧的字符串字段
-                "ak_name": "/".join(ak_names),
-                "ef_name": "/".join(ef_names),
-                # 状态：全签 ✓ / 部分签 ◐ / 全未签 ✗
-                "arknights": self._merge_state(ak_states),
-                "endfield": self._merge_state(ef_states),
-                # 奖励按游戏归属，卡片里分开两行显示
-                "ak_awards": ak_awards,
-                "ef_awards": ef_awards,
-                "failed": failed,
-            })
+            row = self._build_user_row(user_data, today, failed)
+            if row:
+                rows.append(row)
 
         await self.put_kv_data("groups", groups)
         await self.put_kv_data("users", users_data)
@@ -1810,6 +1975,58 @@ class SklandPlugin(Star):
             logger.warning("签到卡片渲染不可用，已回退为纯文本输出（发送 /skdcheck 可诊断）")
 
         yield event.plain_result(self._render_group_status(rows))
+
+    def _build_user_row(self, user_data: dict, today: str,
+                        failed: bool = False) -> dict | None:
+        """
+        把单个用户转成一行卡片数据；没有可展示的角色名时返回 None。
+
+        汇总该用户所有账号在两个游戏上的昵称、签到状态与奖励。
+        同名角色会合并（不同账号/服务器可能重名），避免列表出现重复。
+        """
+        accounts = self._get_accounts(user_data)
+        if not accounts:
+            return None
+
+        ak_names, ak_states, ak_awards = self._collect_game_entries(
+            accounts, "arknights", "arknights", user_data, today)
+        ef_names, ef_states, ef_awards = self._collect_game_entries(
+            accounts, "endfield", "endfield", user_data, today)
+
+        if not ak_names and not ef_names:
+            return None
+
+        return {
+            "name": self._display_name(
+                accounts[0].get("nickname", ""), user_data),
+            # 各游戏的角色名列表：同游戏内用「/」分隔多个账号
+            "ak_names": ak_names,
+            "ef_names": ef_names,
+            # 兼容旧的字符串字段
+            "ak_name": "/".join(ak_names),
+            "ef_name": "/".join(ef_names),
+            # 状态：全签 ✓ / 部分签 ◐ / 全未签 ✗
+            "arknights": self._merge_state(ak_states),
+            "endfield": self._merge_state(ef_states),
+            # 奖励按游戏归属，卡片里分开两行显示
+            "ak_awards": ak_awards,
+            "ef_awards": ef_awards,
+            "failed": failed,
+        }
+
+    def _build_user_rows(self, users_data: dict, today: str) -> list:
+        """
+        把用户数据转成卡片行（与 /skd 群聊完全同构）。
+
+        自动签到推送与登录成功推送都复用这里，保证推送出来的图
+        和群里敲 /skd 看到的图一模一样。
+        """
+        rows = []
+        for user_data in users_data.values():
+            row = self._build_user_row(user_data, today)
+            if row:
+                rows.append(row)
+        return rows
 
     def _render_card(self, rows: list) -> str | None:
         """渲染签到卡片图片，失败返回 None"""

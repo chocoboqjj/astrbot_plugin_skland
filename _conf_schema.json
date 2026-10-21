@@ -14,14 +14,32 @@
   "auto_sign_hour": {
     "description": "自动签到时间（小时）",
     "type": "int",
-    "default": 0,
-    "hint": "自动签到执行的小时（0-23）。签到状态每日 0 点重置，实际签到安排在此后的时间"
+    "default": 8,
+    "hint": "自动签到执行的小时（0-23），默认 8 即早上 8:30 执行签到。签到只落库，不在这一步推送"
   },
   "auto_sign_minute": {
     "description": "自动签到时间（分钟）",
     "type": "int",
     "default": 30,
-    "hint": "自动签到执行的分钟（0-59），默认 30 即 0:30 执行"
+    "hint": "自动签到执行的分钟（0-59），默认 30 即 8:30 执行"
+  },
+  "push_hour": {
+    "description": "签到结果推送时间（小时）",
+    "type": "int",
+    "default": 9,
+    "hint": "每日签到结果推送的小时（0-23），默认 9。读取已落库的签到结果后单独推送，与签到时间互不影响"
+  },
+  "push_minute": {
+    "description": "签到结果推送时间（分钟）",
+    "type": "int",
+    "default": 0,
+    "hint": "每日签到结果推送的分钟（0-59），默认 0 即 9:00 推送"
+  },
+  "push_enabled": {
+    "description": "签到结果推送开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后只做签到落库，不主动推送签到结果（用户仍可用 /skd 主动查询）"
   },
   "auto_sign_delay": {
     "description": "自动签到的延迟，防止风控",
@@ -63,6 +81,12 @@
     "type": "bool",
     "default": false,
     "hint": "开启后 /skd 以图片卡片输出签到状态。需要在系统安装中文字体；缺少 Pillow 或中文字体时会自动回退为纯文本输出"
+  },
+  "push_card_image": {
+    "description": "签到结果图片推送",
+    "type": "bool",
+    "default": true,
+    "hint": "每日签到结果推送与新用户登录成功后，以图片卡片输出（与 /skd 指令同款）。缺少 Pillow 或中文字体时会自动回退为纯文本"
   },
   "card_theme": {
     "description": "卡片主题",
