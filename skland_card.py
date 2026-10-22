@@ -11,6 +11,7 @@
 import glob
 import os
 import tempfile
+from datetime import datetime
 from typing import Optional
 
 # 插件目录（用于查找随插件打包的字体）
@@ -141,6 +142,15 @@ THEME_LIGHT = {
 
 GAME_LABELS = (("明日方舟", "arknights"), ("终末地", "endfield"))
 
+# 星期中文简称，用于日期后缀
+_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def format_date_cn(dt: datetime) -> str:
+    """把时间格式化成中文日期：2026年10月22日 周四"""
+    return (f"{dt.year}年{dt.month}月{dt.day}日 "
+            f"{_WEEKDAYS[dt.weekday()]}")
+
 
 def _state_value(state) -> str:
     """
@@ -225,6 +235,31 @@ class CardRenderer:
             except Exception:
                 self._font_cache[key] = ImageFont.truetype(self.font_path, size)
         return self._font_cache[key]
+
+    def _format_award_segment(self, pairs, flat) -> str:
+        """
+        把某个游戏的奖励渲染成一段文本。
+
+        pairs 是 [(角色名, [道具...]), ...]，flat 是压平后的道具列表
+        （兼容没有分组信息的旧数据）。
+
+        单角色时只显示道具（「源石x100、龙门币x500」）——
+        上一行已经写了角色名，再重复一遍是冗余。
+        多角色时才带前缀（「刀客:源石x100 夜莺:龙门币x500」），
+        避免多账号时道具混成一坨、分不清是谁拿到的。
+        """
+        if pairs:
+            # 只统计真正拿到奖励的角色数
+            named = [(str(name), [str(a) for a in (items or []) if a])
+                     for name, items in pairs]
+            named = [(n, i) for n, i in named if i]
+            if not named:
+                return ""
+            if len(named) == 1:
+                return "、".join(named[0][1])
+            return " ".join(f"{n}:{'、'.join(i)}" for n, i in named)
+        items = [str(a) for a in (flat or []) if a]
+        return "、".join(items) if items else ""
 
     def _fit_text(self, d, text: str, max_px: int, size: int,
                   bold: bool = False, min_size: int = 14) -> tuple[str, int]:
@@ -325,13 +360,16 @@ class CardRenderer:
             self._cross(d, x, y + 5, 20, c["bad"])
 
     def render(self, rows: list, title: str = "森空岛签到",
-               subtitle: str = "Skland Daily Check-in") -> Optional[str]:
+               subtitle: str = "Skland Daily Check-in",
+               date_text: str = "") -> Optional[str]:
         """
         渲染签到卡片。
 
         rows: [{"name": str, "ak_name": str, "ef_name": str,
                 "arknights": bool|str, "endfield": bool|str}]
         状态可为 bool（True/False）或 "all"/"part"/"none"（多账号合并状态）。
+        date_text: 卡片上显示的日期（中文「2026年10月22日」格式），
+                   为空时用当前日期。
         返回临时图片路径；不可用或失败时返回 None，由调用方回退纯文本。
         """
         if not self.available:
@@ -353,6 +391,8 @@ class CardRenderer:
             NAME_H = 34   # 名字行高（23px 字号 + 11px 间距）
             AWARD_H = 24  # 奖励行高（15px 字号 + 底部留白）
             ROW = 54      # 无奖励用户的整行高度
+            # 头部高度：标题 36px + 副标题 + 日期行
+            HEAD_H = 166
 
             # 先算总高度再决定画布，避免底部留白
             total_h = 0
@@ -369,7 +409,7 @@ class CardRenderer:
                     total_h += NAME_H + AWARD_H
                 else:
                     total_h += ROW
-            H = 150 + max(total_h, 1) + 62
+            H = HEAD_H + max(total_h, 1) + 62
 
             img = Image.new("RGB", (W, H), c["bg"])
             d = ImageDraw.Draw(img)
@@ -382,6 +422,17 @@ class CardRenderer:
             self._text(d, (PAD, 34), title, 36, c["text"], bold=True)
             self._text(d, (PAD + 2, 82), subtitle, 16, c["muted"])
 
+            # 日期行：签到日期在左，图片生成时间在右
+            # 生成时间用「生成于 HH:MM:SS」，与签到日期区分开。
+            # 字号比签到日期小一号：生成时间是次要信息，
+            # 与右上角「已签到」标签保持同一层级。
+            now = datetime.now()
+            date_label = date_text or format_date_cn(now)
+            self._text(d, (PAD + 2, 108), date_label, 17, c["text"])
+            gen_label = f"生成于 {now.strftime('%H:%M:%S')}"
+            gw = d.textlength(gen_label, font=self._font(15))
+            self._text(d, (W - PAD - gw, 110), gen_label, 15, c["muted"])
+
             # 右上统计：按「人」计数（与底部汇总口径一致）
             signed = sum(1 for r in rows
                          if _state_value(r.get("arknights")) != "none"
@@ -392,11 +443,11 @@ class CardRenderer:
             lw = d.textlength("已签到", font=self._font(15))
             self._text(d, (W - PAD - lw, 78), "已签到", 15, c["muted"])
 
-            d.rectangle([PAD, 118, W - PAD, 119], fill=c["div"])
+            d.rectangle([PAD, 136, W - PAD, 137], fill=c["div"])
 
             # 一个人一行：两个游戏用斜杠横向合并，勾叉与名字一一对应
             # 奖励另起一行显示（不与名字对齐），两个游戏的奖励用「｜」分隔
-            y = 142
+            y = 160
             for r in rows:
                 # 角色名列表：同游戏内多个账号用「/」分隔
                 ak_names = r.get("ak_names")
@@ -463,18 +514,17 @@ class CardRenderer:
                 y += NAME_H
 
                 # 奖励另起一行：两个游戏的奖励用「｜」分隔，不做列对齐
-                ak_awards = [str(a) for a in (r.get("ak_awards") or []) if a]
-                ef_awards = [str(a) for a in (r.get("ef_awards") or []) if a]
-                if not ak_awards and not ef_awards:
+                ak_segment = self._format_award_segment(
+                    r.get("ak_award_pairs"), r.get("ak_awards"))
+                ef_segment = self._format_award_segment(
+                    r.get("ef_award_pairs"), r.get("ef_awards"))
+                if not ak_segment and not ef_segment:
                     # 兼容旧数据：只有单一 awards 字段时归到方舟
                     single = r.get("awards") or []
-                    ak_awards = [str(a) for a in single if a]
-                if ak_awards or ef_awards:
-                    parts = []
-                    if ak_awards:
-                        parts.append("、".join(ak_awards))
-                    if ef_awards:
-                        parts.append("、".join(ef_awards))
+                    ak_segment = "、".join(
+                        str(a) for a in single if a)
+                if ak_segment or ef_segment:
+                    parts = [p for p in (ak_segment, ef_segment) if p]
                     award_text = " ｜ ".join(parts)
                     award_x = PAD + 58
                     award_px = W - PAD - award_x

@@ -51,7 +51,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.star.config import put_config
 
 from .skland_api import SklandAPI
-from .skland_card import CardRenderer
+from .skland_card import CardRenderer, format_date_cn
 
 PLUGIN_NAME = "astrbot_plugin_skland"
 
@@ -82,7 +82,7 @@ PLATFORM_CAPABILITY = {
 }
 
 
-@register(PLUGIN_NAME, "AstrBot", "森空岛自动签到插件（支持 OneBot 与 QQ 官方机器人）", "1.7.0")
+@register(PLUGIN_NAME, "AstrBot", "森空岛自动签到插件（支持 OneBot 与 QQ 官方机器人）", "1.8.0")
 class SklandPlugin(Star):
     """森空岛签到插件"""
 
@@ -548,12 +548,52 @@ class SklandPlugin(Star):
             await self.put_kv_data("groups", migrated)
             logger.info("森空岛插件：群记录结构已迁移到新版格式")
 
+    async def _migrate_awards_format(self) -> None:
+        """
+        把旧版 game_awards 结构（{游戏: [道具...]}）清掉。
+
+        新版结构是 {游戏: {"date": "2026-10-22", "items": [...]}}，
+        奖励带日期才能判断跨天后该不该失效。
+
+        旧版没有日期信息，且因为历史 bug（setdefault 不覆盖），
+        里面的道具可能停留在**第一次签到**那天，早就过期了。
+        所以这里不做日期猜测，直接清空 —— 下次签到会写入带日期的正确数据。
+        保留过期数据反而会让用户看到「今天没签到却挂着老道具」。
+        """
+        try:
+            users = await self.get_kv_data("users", {})
+            if not users:
+                return
+            changed = False
+            for user_data in users.values():
+                if not isinstance(user_data, dict):
+                    continue
+                for account in self._get_accounts(user_data):
+                    awards_map = account.get("game_awards")
+                    if not isinstance(awards_map, dict) or not awards_map:
+                        continue
+                    # 只清理旧格式（值是 list）；新格式（值是 dict）不动
+                    legacy = [k for k, v in awards_map.items()
+                              if isinstance(v, list)]
+                    if not legacy:
+                        continue
+                    for key in legacy:
+                        awards_map.pop(key, None)
+                    changed = True
+            if changed:
+                await self.put_kv_data("users", users)
+                logger.info(
+                    "森空岛插件：旧版签到奖励数据已清理（下次签到会重新记录）")
+        except Exception as e:
+            logger.warning(f"森空岛：迁移奖励数据失败（不影响启动）: {e}")
+
     # ==================== Lifecycle ====================
 
     async def initialize(self):
         """插件初始化"""
         logger.info("森空岛签到插件已加载")
         await self._migrate_storage()
+        await self._migrate_awards_format()
         await self._migrate_sign_time()
         config = self._get_config()
         if config.get("auto_sign_enabled", False):
@@ -712,14 +752,24 @@ class SklandPlugin(Star):
         return names
 
     @staticmethod
-    def _store_game_awards(user_data: dict, results: list) -> dict:
+    def _store_game_awards(user_data: dict, results: list, today: str = "") -> dict:
         """
-        按游戏分别记录奖励。
+        按游戏分别记录奖励，并记录获得奖励的日期。
 
         与 game_names 同理，奖励也归属到具体游戏，
         避免方舟的奖励被显示在终末地那行。
+
+        两个关键点：
+        1. **必须覆盖而非 setdefault**。奖励每天都不一样，
+           用 setdefault 只会保留第一次签到拿到的道具，
+           之后每天显示的都是老奖励。
+        2. **带上日期**。跨天后昨天的奖励必须失效，
+           否则会出现「今天显示 ✗ 未签到，却挂着昨天的道具」。
         """
+        today = today or datetime.now().strftime("%Y-%m-%d")
         awards_map = user_data.get("game_awards") or {}
+        # 本次签到的游戏 → 奖励列表
+        fresh: dict[str, list[str]] = {}
         for r in results:
             key = "arknights" if r.game == "明日方舟" else (
                 "endfield" if r.game == "终末地" else None
@@ -727,10 +777,38 @@ class SklandPlugin(Star):
             if key is None:
                 continue
             items = [str(a) for a in (getattr(r, "awards", None) or []) if a]
-            if items:
-                awards_map.setdefault(key, items)
+            if not items:
+                continue
+            # 同一游戏下可能有多个角色（终末地多角色），
+            # 奖励累加而不是互相覆盖
+            bucket = fresh.setdefault(key, [])
+            for it in items:
+                if it not in bucket:
+                    bucket.append(it)
+
+        for key, items in fresh.items():
+            awards_map[key] = {"date": today, "items": items}
         user_data["game_awards"] = awards_map
         return awards_map
+
+    @staticmethod
+    def _get_awards_for_day(awards_map: dict, game_key: str,
+                             today: str) -> list[str]:
+        """
+        取出某个游戏**当天**拿到的奖励。
+
+        兼容两种存储：
+        - 新版 {"date": "2026-10-21", "items": [...]}：按 date 精确匹配
+        - 旧版 ["源石x100"]：没有日期信息，无法判断是否当天，
+          按「没有日期就不展示」处理，避免把陈旧奖励当成今天的
+        """
+        entry = (awards_map or {}).get(game_key)
+        if isinstance(entry, dict):
+            if entry.get("date") != today:
+                return []
+            return [str(a) for a in (entry.get("items") or []) if a]
+        # 旧格式：无法确认是当天的奖励，不展示
+        return []
 
     @staticmethod
     def _is_signed_today_static(result) -> bool:
@@ -806,7 +884,7 @@ class SklandPlugin(Star):
                     results, nickname = await self.api.do_full_sign_in(token)
                     self._mark_signed(account, results, today)
                     self._store_game_names(account, results)
-                    self._store_game_awards(account, results)
+                    self._store_game_awards(account, results, today)
 
                     body = self._format_sign_status(results, nickname)
                     ok = any(self._is_signed_today(r) for r in results) if results else False
@@ -887,7 +965,7 @@ class SklandPlugin(Star):
                 card_path = None
                 if config.get("push_card_image", True):
                     card_path = self._render_card(
-                        self._private_card_rows(user_data, today))
+                        self._private_card_rows(user_data, today), today)
                 if card_path:
                     await self._push_to_user(
                         user_id, user_data, "", image_path=card_path)
@@ -1065,6 +1143,7 @@ class SklandPlugin(Star):
             "ak_name": "", "ef_name": "",
             "arknights": "none", "endfield": "none",
             "ak_awards": [], "ef_awards": [],
+            "ak_award_pairs": [], "ef_award_pairs": [],
             "failed": False,
         }]
 
@@ -1283,7 +1362,8 @@ class SklandPlugin(Star):
                 "arknights": True, "endfield": False,
             }]
             try:
-                path = self._render_card(test_rows)
+                path = self._render_card(
+                    test_rows, datetime.now().strftime("%Y-%m-%d"))
                 if path:
                     lines.append(f"渲染测试: ✅ 成功（{path}）")
                 else:
@@ -1488,7 +1568,7 @@ class SklandPlugin(Star):
             }
             self._mark_signed(account, results, now.strftime("%Y-%m-%d"))
             self._store_game_names(account, results)
-            self._store_game_awards(account, results)
+            self._store_game_awards(account, results, now.strftime("%Y-%m-%d"))
 
             body = self._format_sign_status(results, nickname)
             account["last_result"] = {
@@ -1552,7 +1632,8 @@ class SklandPlugin(Star):
             # 让用户立刻看到自己今天的签到状态与奖励
             if not had_account_before and config.get("push_card_image", True):
                 card_path = self._render_card(
-                    self._private_card_rows(user_data, now.strftime("%Y-%m-%d")))
+                    self._private_card_rows(user_data, now.strftime("%Y-%m-%d")),
+                    now.strftime("%Y-%m-%d"))
                 if card_path:
                     yield event.chain_result([Comp.Image.fromFileSystem(card_path)])
                 else:
@@ -1747,7 +1828,7 @@ class SklandPlugin(Star):
 
     def _collect_game_entries(self, accounts: list, game_key: str, game_name: str,
                               user_data: dict, today: str = "") -> tuple[list[str], list[bool],
-                                                      list[str]]:
+                                                      list[list[str]]]:
         """
         收集多个账号在某游戏上的角色名、签到状态与奖励。
 
@@ -1758,12 +1839,17 @@ class SklandPlugin(Star):
         today 为空时按「历史上签到过」判定；传入日期时只认当天的签到记录
         （last_sign 存的是日期，跨天自动失效）。
 
-        返回 (角色名列表, 状态列表, 奖励列表)
+        奖励同样只认**当天**拿到的：昨天的道具不该挂在今天的卡片上。
+
+        返回 (角色名列表, 状态列表, 每个角色的奖励列表)
+        第三个返回值与角色名列表一一对应，
+        这样卡片上不会出现「两个角色名对着一坨合并的道具」。
         """
         today = today or datetime.now().strftime("%Y-%m-%d")
         names: list[str] = []
         states: list[bool] = []
-        awards: list[str] = []
+        # 与 names 一一对应：每个角色各自拿到的奖励
+        groups: list[list[str]] = []
 
         for account in accounts:
             last_sign = account.get("last_sign") or {}
@@ -1774,23 +1860,23 @@ class SklandPlugin(Star):
             name = names_map.get(game_name) or (nick if signed else "")
             if not name:
                 continue
-            items = [str(a) for a in (awards_map.get(game_name) or []) if a]
+            # 只取当天拿到的奖励，且只在当天确实签到时才展示
+            items = self._get_awards_for_day(awards_map, game_name, today) \
+                if signed else []
 
             if name in names:
                 idx = names.index(name)
                 # 状态取并集：任一账号签了就算这个角色签了
                 states[idx] = states[idx] or signed
                 for it in items:
-                    if it not in awards:
-                        awards.append(it)
+                    if it not in groups[idx]:
+                        groups[idx].append(it)
             else:
                 names.append(name)
                 states.append(signed)
-                for it in items:
-                    if it not in awards:
-                        awards.append(it)
+                groups.append(list(items))
 
-        return names, states, awards
+        return names, states, groups
 
     @staticmethod
     def _normalize_state(state) -> str:
@@ -1881,7 +1967,9 @@ class SklandPlugin(Star):
 
             text = self._render_stored_result(user_data)
             if config.get("card_image_enabled", False):
-                path = self._render_card(self._private_card_rows(user_data))
+                today = datetime.now().strftime("%Y-%m-%d")
+                path = self._render_card(
+                    self._private_card_rows(user_data, today), today)
                 if path:
                     # 只发图片，不再附带纯文本
                     yield event.chain_result([Comp.Image.fromFileSystem(path)])
@@ -1945,7 +2033,7 @@ class SklandPlugin(Star):
                             account["nickname"] = live_nick
                         self._mark_signed(account, results, today)
                         self._store_game_names(account, results)
-                        self._store_game_awards(account, results)
+                        self._store_game_awards(account, results, today)
                     except Exception as e:
                         logger.warning(f"群聊实时查询用户 {uid} 失败: {e}")
                         failed_accounts += 1
@@ -1967,7 +2055,7 @@ class SklandPlugin(Star):
 
         # 优先输出图片卡片，不可用时回退纯文本
         if config.get("card_image_enabled", False):
-            path = self._render_card(rows)
+            path = self._render_card(rows, today)
             if path:
                 # 只发图片，不再附带纯文本
                 yield event.chain_result([Comp.Image.fromFileSystem(path)])
@@ -1988,13 +2076,17 @@ class SklandPlugin(Star):
         if not accounts:
             return None
 
-        ak_names, ak_states, ak_awards = self._collect_game_entries(
+        ak_names, ak_states, ak_groups = self._collect_game_entries(
             accounts, "arknights", "arknights", user_data, today)
-        ef_names, ef_states, ef_awards = self._collect_game_entries(
+        ef_names, ef_states, ef_groups = self._collect_game_entries(
             accounts, "endfield", "endfield", user_data, today)
 
         if not ak_names and not ef_names:
             return None
+
+        # 每个角色各自拿到的奖励，供卡片把「名字 ↔ 道具」对上
+        ak_award_pairs = list(zip(ak_names, ak_groups))
+        ef_award_pairs = list(zip(ef_names, ef_groups))
 
         return {
             "name": self._display_name(
@@ -2009,10 +2101,23 @@ class SklandPlugin(Star):
             "arknights": self._merge_state(ak_states),
             "endfield": self._merge_state(ef_states),
             # 奖励按游戏归属，卡片里分开两行显示
-            "ak_awards": ak_awards,
-            "ef_awards": ef_awards,
+            "ak_awards": self._flatten_awards(ak_groups),
+            "ef_awards": self._flatten_awards(ef_groups),
+            # 按角色分组，渲染时一一对应
+            "ak_award_pairs": ak_award_pairs,
+            "ef_award_pairs": ef_award_pairs,
             "failed": failed,
         }
+
+    @staticmethod
+    def _flatten_awards(groups: list[list[str]]) -> list[str]:
+        """把分组奖励压平成一个去重列表（兼容旧的扁平结构）"""
+        out: list[str] = []
+        for items in groups:
+            for it in items:
+                if it not in out:
+                    out.append(it)
+        return out
 
     def _build_user_rows(self, users_data: dict, today: str) -> list:
         """
@@ -2028,8 +2133,17 @@ class SklandPlugin(Star):
                 rows.append(row)
         return rows
 
-    def _render_card(self, rows: list) -> str | None:
-        """渲染签到卡片图片，失败返回 None"""
+    def _render_card(self, rows: list, today: str = "") -> str | None:
+        """
+        渲染签到卡片图片，失败返回 None。
+
+        today 是卡片上显示的**签到日期**（YYYY-MM-DD）。
+        卡片上会同时显示两个时间：
+        - 签到日期：这份数据是哪天的签到结果
+        - 图片生成时间：这张图是什么时候画出来的
+        两者可能不同（例如 9:00 推送的是 8:30 签到的数据，
+        跨天时更明显），分开显示才不会误读。
+        """
         if not rows:
             return None
         try:
@@ -2043,7 +2157,14 @@ class SklandPlugin(Star):
                     "请安装 Pillow 并在系统安装中文字体（如 fonts-noto-cjk）"
                 )
                 return None
-            return self._card.render(rows)
+            date_text = ""
+            if today:
+                try:
+                    date_text = format_date_cn(
+                        datetime.strptime(today, "%Y-%m-%d"))
+                except (TypeError, ValueError):
+                    date_text = ""
+            return self._card.render(rows, date_text=date_text)
         except Exception as e:
             logger.warning(f"卡片渲染失败: {e}")
             return None
